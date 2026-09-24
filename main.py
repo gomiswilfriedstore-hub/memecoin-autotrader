@@ -33,8 +33,9 @@ PRIORITY_FEE = float(os.environ.get("PRIORITY_FEE", "0.003"))
 # STRATÉGIE STOP-LOSS : Vente à -15% du prix d'achat initial
 STOP_LOSS_PCT = 0.15  # -15% par rapport au prix d'achat
 
-MIN_LIQUIDITY_USD = 10000
-MIN_VOLUME_5M = 3000
+# NOUVEAUX SEUILS PLUS RÉACTIFS
+MIN_LIQUIDITY_USD = 3000
+MIN_VOLUME_5M = 1000
 
 RPC_URL = "https://api.mainnet-beta.solana.com"
 PUMP_FUN_WS = "wss://pumpportal.fun/api/data"
@@ -52,7 +53,7 @@ if SOLANA_PRIVATE_KEY:
 
 def check_security_and_score(token_address):
     try:
-        # Vérification DexScreener (Liquidité & Volume)
+        # 1. Vérification DexScreener (Liquidité & Volume)
         dex_res = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{token_address}", timeout=4).json()
         pairs = dex_res.get("pairs", [])
         if not pairs:
@@ -66,7 +67,7 @@ def check_security_and_score(token_address):
         if liquidity < MIN_LIQUIDITY_USD or volume_5m < MIN_VOLUME_5M: 
             return None
 
-        # Vérification RugCheck de base (Mint & Freeze)
+        # 2. Vérification RugCheck (Mint, Freeze & Risques Dev)
         rug_res = requests.get(f"https://api.rugcheck.xyz/v1/tokens/{token_address}/report/summary", timeout=4)
         if rug_res.status_code != 200:
             return None
@@ -74,8 +75,20 @@ def check_security_and_score(token_address):
         rug_data = rug_res.json()
         risks = [r.get("name", "") for r in rug_data.get("risks", [])]
 
+        # Rejet si le créateur peut imprimer des tokens ou geler les comptes
         if "Mint Authority Enabled" in risks or "Freeze Authority Enabled" in risks: 
             return None
+
+        # PARMÈTRE DE LA VIDÉO : Vérification de la concentration et du verrouillage du Dev
+        dev_risks = [
+            "Single holder ownership", 
+            "High holder concentration", 
+            "Creator balance high",
+            "Large Amount of LP Unlocked"
+        ]
+        for risk in risks:
+            if any(dev_risk.lower() in risk.lower() for dev_risk in dev_risks):
+                return None
 
         return {
             "name": pair["baseToken"]["name"],
@@ -122,10 +135,8 @@ async def execute_trade(action, token_address, amount):
 
 async def monitor_and_auto_sell(app, token_address, symbol, entry_price):
     peak_price = entry_price
-    # Déclencheur du Stop-Loss fixe à -15%
     sl_trigger_price = entry_price * (1 - STOP_LOSS_PCT)
 
-    # Surveillance (144 cycles de 5s = 12 minutes)
     for _ in range(144):
         await asyncio.sleep(5)
         try:
@@ -142,7 +153,6 @@ async def monitor_and_auto_sell(app, token_address, symbol, entry_price):
             gain_pct = ((current_price - entry_price) / entry_price) * 100
             peak_gain_pct = ((peak_price - entry_price) / entry_price) * 100
 
-            # Vente automatique si baisse à <= -15% du prix d'achat
             if current_price <= sl_trigger_price:
                 tx_hash = await execute_trade("sell", token_address, "100%")
                 
@@ -172,7 +182,9 @@ async def listen_new_launches(app):
                 
                 if "mint" in data and BOT_ACTIVE:
                     token_address = data["mint"]
-                    await asyncio.sleep(4)
+                    
+                    # Temps d'attente réduit à 2 secondes pour être plus réactif
+                    await asyncio.sleep(2)
                     
                     setup = check_security_and_score(token_address)
 
@@ -184,8 +196,8 @@ async def listen_new_launches(app):
                                 f"🤖 **AUTO-BUY EXÉCUTÉ !**\n\n"
                                 f"💎 **Token:** {setup['name']} (${setup['symbol']})\n"
                                 f"💵 **Montant:** {BUY_AMOUNT_SOL} SOL\n"
-                                f"🔒 **Sécurité:** RugCheck Validé\n"
-                                f"📈 **Stratégie:** Conservation tant qu'il monte / Vente à -15%\n"
+                                f"🔒 **Sécurité:** Dev Lock & RugCheck Validés\n"
+                                f"📈 **Stratégie:** Hold / Vente à -15%\n"
                                 f"🔗 [Solscan](https://solscan.io/tx/{tx_hash})"
                             )
                             await app.bot.send_message(chat_id=CHAT_ID_TARGET, text=msg, parse_mode="Markdown")
@@ -197,7 +209,7 @@ async def listen_new_launches(app):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global BOT_ACTIVE
     BOT_ACTIVE = True
-    await update.message.reply_text("🟢 **Bot Activé !** Revente uniquement si le prix chute de 15% sous le prix d'achat.")
+    await update.message.reply_text("🟢 **Bot Activé !** Surveillance ultra-réactive avec filtres Dev Lock & Stop-Loss 15% actifs.")
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global BOT_ACTIVE
