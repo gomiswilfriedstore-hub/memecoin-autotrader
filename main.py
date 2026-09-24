@@ -31,7 +31,7 @@ SLIPPAGE_PCT = float(os.environ.get("SLIPPAGE_PCT", "20"))
 PRIORITY_FEE = float(os.environ.get("PRIORITY_FEE", "0.003"))
 
 # STRATÉGIE STOP-LOSS : Vente à -15% du prix d'achat initial
-STOP_LOSS_PCT = 0.15  # -15% par rapport au prix d'achat
+STOP_LOSS_PCT = 0.15
 
 # SEUILS ÉQUILIBRÉS (OPTION B)
 MIN_LIQUIDITY_USD = 1000
@@ -53,7 +53,6 @@ if SOLANA_PRIVATE_KEY:
 
 def check_security_and_score(token_address):
     try:
-        # 1. Vérification DexScreener (Liquidité $1k & Volume $500)
         dex_res = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{token_address}", timeout=4).json()
         pairs = dex_res.get("pairs", [])
         if not pairs:
@@ -67,7 +66,6 @@ def check_security_and_score(token_address):
         if liquidity < MIN_LIQUIDITY_USD or volume_5m < MIN_VOLUME_5M: 
             return None
 
-        # 2. Vérification RugCheck (Mint, Freeze & Risques Dev)
         rug_res = requests.get(f"https://api.rugcheck.xyz/v1/tokens/{token_address}/report/summary", timeout=4)
         if rug_res.status_code != 200:
             return None
@@ -78,7 +76,6 @@ def check_security_and_score(token_address):
         if "Mint Authority Enabled" in risks or "Freeze Authority Enabled" in risks: 
             return None
 
-        # Filtre Dev Lock & Concentration
         dev_risks = [
             "Single holder ownership", 
             "High holder concentration", 
@@ -170,44 +167,58 @@ async def monitor_and_auto_sell(app, token_address, symbol, entry_price):
 
 async def listen_new_launches(app):
     global BOT_ACTIVE
-    async with websockets.connect(PUMP_FUN_WS) as ws:
-        await ws.send(json.dumps({"method": "subscribeNewToken"}))
-        print("⚡ SURVEILLANCE ACTIVE...")
+    while True:
+        try:
+            # ping_interval=20 et ping_timeout=10 maintiennent le canal WebSocket ouvert en permanence
+            async with websockets.connect(
+                PUMP_FUN_WS, 
+                ping_interval=20, 
+                ping_timeout=10, 
+                close_timeout=5
+            ) as ws:
+                await ws.send(json.dumps({"method": "subscribeNewToken"}))
+                print("⚡ SURVEILLANCE ACTIVE...")
 
-        while True:
-            try:
-                message = await ws.recv()
-                data = json.loads(message)
-                
-                if "mint" in data and BOT_ACTIVE:
-                    token_address = data["mint"]
-                    
-                    await asyncio.sleep(2)
-                    
-                    setup = check_security_and_score(token_address)
+                while True:
+                    try:
+                        message = await ws.recv()
+                        data = json.loads(message)
+                        
+                        if "mint" in data and BOT_ACTIVE:
+                            token_address = data["mint"]
+                            await asyncio.sleep(2)
+                            
+                            setup = await asyncio.to_thread(check_security_and_score, token_address)
 
-                    if setup and signer_keypair:
-                        tx_hash = await execute_trade("buy", token_address, BUY_AMOUNT_SOL)
+                            if setup and signer_keypair:
+                                tx_hash = await execute_trade("buy", token_address, BUY_AMOUNT_SOL)
 
-                        if tx_hash:
-                            msg = (
-                                f"🤖 **AUTO-BUY EXÉCUTÉ !**\n\n"
-                                f"💎 **Token:** {setup['name']} (${setup['symbol']})\n"
-                                f"💵 **Montant:** {BUY_AMOUNT_SOL} SOL\n"
-                                f"🔒 **Sécurité:** Dev Lock & RugCheck Validés\n"
-                                f"📈 **Stratégie:** Hold / Vente à -15%\n"
-                                f"🔗 [Solscan](https://solscan.io/tx/{tx_hash})"
-                            )
-                            await app.bot.send_message(chat_id=CHAT_ID_TARGET, text=msg, parse_mode="Markdown")
-                            asyncio.create_task(monitor_and_auto_sell(app, token_address, setup['symbol'], setup['price_usd']))
-            except Exception as e:
-                print(f"Erreur WS: {e}")
-                await asyncio.sleep(2)
+                                if tx_hash:
+                                    msg = (
+                                        f"🤖 **AUTO-BUY EXÉCUTÉ !**\n\n"
+                                        f"💎 **Token:** {setup['name']} (${setup['symbol']})\n"
+                                        f"💵 **Montant:** {BUY_AMOUNT_SOL} SOL\n"
+                                        f"🔒 **Sécurité:** Dev Lock & RugCheck Validés\n"
+                                        f"📈 **Stratégie:** Hold / Vente à -15%\n"
+                                        f"🔗 [Solscan](https://solscan.io/tx/{tx_hash})"
+                                    )
+                                    await app.bot.send_message(chat_id=CHAT_ID_TARGET, text=msg, parse_mode="Markdown")
+                                    asyncio.create_task(monitor_and_auto_sell(app, token_address, setup['symbol'], setup['price_usd']))
+                    except websockets.exceptions.ConnectionClosed:
+                        print("🔄 Déconnexion temporaire du flux, reconnexion...")
+                        break
+                    except Exception as inner_e:
+                        print(f"Erreur traitement token: {inner_e}")
+                        continue
+
+        except Exception as e:
+            print(f"Erreur connexion WebSocket: {e}")
+            await asyncio.sleep(3)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global BOT_ACTIVE
     BOT_ACTIVE = True
-    await update.message.reply_text("🟢 **Bot Activé !** Paramètres Option B ($1k liq / $500 vol) actifs.")
+    await update.message.reply_text("🟢 **Bot Activé !** Flux WebSocket stabilisé.")
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global BOT_ACTIVE
