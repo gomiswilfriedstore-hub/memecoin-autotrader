@@ -12,15 +12,16 @@ from solana.rpc.async_api import AsyncClient
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# --- SERVEUR KEEP-ALIVE POUR RENDER ---
+# Serveur web Keep-Alive pour Render
 def keep_alive():
     port = int(os.environ.get("PORT", 10000))
-    server = socketserver.TCPServer(("0.0.0.0", port), http.server.SimpleHTTPRequestHandler)
-    server.serve_forever()
+    handler = http.server.SimpleHTTPRequestHandler
+    httpd = socketserver.TCPServer(("0.0.0.0", port), handler)
+    httpd.serve_forever()
 
 threading.Thread(target=keep_alive, daemon=True).start()
 
-# --- CONFIGURATION DE L'ENVIRONNEMENT ---
+# Variables d'environnement
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID_TARGET = os.environ.get("CHAT_ID")
 SOLANA_PRIVATE_KEY = os.environ.get("SOLANA_PRIVATE_KEY")
@@ -30,8 +31,8 @@ SLIPPAGE_PCT = float(os.environ.get("SLIPPAGE_PCT", "20"))
 PRIORITY_FEE = float(os.environ.get("PRIORITY_FEE", "0.003"))
 
 # Stratégie Trailing Stop
-INITIAL_SL_PCT = 0.20       # Stop-Loss initial à -20%
-TRAILING_STOP_PCT = 0.15    # Revente si chute de 15% depuis le sommet
+INITIAL_SL_PCT = 0.20       # Stop-Loss initial (-20%)
+TRAILING_STOP_PCT = 0.15    # Chute de 15% depuis le sommet
 
 MIN_LIQUIDITY_USD = 10000
 MIN_VOLUME_5M = 3000
@@ -50,7 +51,6 @@ if SOLANA_PRIVATE_KEY:
     except Exception as e:
         print(f"❌ Erreur Clé Privée : {e}")
 
-# --- FONCTION DE SÉCURITÉ ---
 def check_security_and_score(token_address):
     try:
         dex_res = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{token_address}", timeout=4).json()
@@ -97,7 +97,6 @@ def check_security_and_score(token_address):
     except Exception:
         return None
 
-# --- ENVOI DE TRANSACTION ---
 async def send_solana_transaction(tx_bytes):
     try:
         tx = VersionedTransaction.from_bytes(tx_bytes)
@@ -130,8 +129,7 @@ async def execute_trade(action, token_address, amount):
         print(f"❌ Erreur {action}: {e}")
     return None
 
-# --- MONITORING ET REVENTE ---
-async def monitor_and_auto_sell(bot, token_address, symbol, entry_price):
+async def monitor_and_auto_sell(app, token_address, symbol, entry_price):
     peak_price = entry_price
     initial_sl_price = entry_price * (1 - INITIAL_SL_PCT)
 
@@ -140,12 +138,10 @@ async def monitor_and_auto_sell(bot, token_address, symbol, entry_price):
         try:
             res = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{token_address}", timeout=3).json()
             pairs = res.get("pairs", [])
-            if not pairs:
-                continue
+            if not pairs: continue
 
             current_price = float(pairs[0].get("priceUsd", 0))
-            if current_price <= 0:
-                continue
+            if current_price <= 0: continue
 
             if current_price > peak_price:
                 peak_price = current_price
@@ -174,13 +170,12 @@ async def monitor_and_auto_sell(bot, token_address, symbol, entry_price):
                         f"🔗 [Solscan](https://solscan.io/tx/{tx_hash})"
                     )
 
-                await bot.send_message(chat_id=CHAT_ID_TARGET, text=msg, parse_mode="Markdown")
+                await app.bot.send_message(chat_id=CHAT_ID_TARGET, text=msg, parse_mode="Markdown")
                 break
         except Exception:
             continue
 
-# --- ECOUTE DES NOUVEAUX TOKENS ---
-async def listen_new_launches(bot):
+async def listen_new_launches(app):
     global BOT_ACTIVE
     async with websockets.connect(PUMP_FUN_WS) as ws:
         await ws.send(json.dumps({"method": "subscribeNewToken"}))
@@ -209,13 +204,12 @@ async def listen_new_launches(bot):
                                 f"📈 **Stratégie:** Trailing Stop Active\n"
                                 f"🔗 [Solscan](https://solscan.io/tx/{tx_hash})"
                             )
-                            await bot.send_message(chat_id=CHAT_ID_TARGET, text=msg, parse_mode="Markdown")
-                            asyncio.create_task(monitor_and_auto_sell(bot, token_address, setup['symbol'], setup['price_usd']))
+                            await app.bot.send_message(chat_id=CHAT_ID_TARGET, text=msg, parse_mode="Markdown")
+                            asyncio.create_task(monitor_and_auto_sell(app, token_address, setup['symbol'], setup['price_usd']))
             except Exception as e:
                 print(f"Erreur WS: {e}")
                 await asyncio.sleep(2)
 
-# --- COMMANDES TELEGRAM ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global BOT_ACTIVE
     BOT_ACTIVE = True
@@ -226,17 +220,12 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     BOT_ACTIVE = False
     await update.message.reply_text("🔴 **Bot en Pause !** Aucun achat automatique ne sera fait.")
 
-def main():
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("stop", stop))
-
-    # Lancement du flux WebSocket en tâche de fond dès le démarrage du bot
-    asyncio.get_event_loop().create_task(listen_new_launches(app.bot))
-
-    print("🤖 Bot Telegram démarré...")
-    app.run_polling()
+async def post_init(app):
+    asyncio.create_task(listen_new_launches(app))
 
 if __name__ == "__main__":
-    main()
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("stop", stop))
+    print("🤖 Démarrage du bot...")
+    app.run_polling()
