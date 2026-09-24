@@ -30,10 +30,7 @@ BUY_AMOUNT_SOL = float(os.environ.get("BUY_AMOUNT_SOL", "0.05"))
 SLIPPAGE_PCT = float(os.environ.get("SLIPPAGE_PCT", "20"))
 PRIORITY_FEE = float(os.environ.get("PRIORITY_FEE", "0.003"))
 
-# STRATÉGIE STOP-LOSS : Vente à -15% du prix d'achat initial
 STOP_LOSS_PCT = 0.15
-
-# SEUILS ÉQUILIBRÉS (OPTION B)
 MIN_LIQUIDITY_USD = 1000
 MIN_VOLUME_5M = 500
 
@@ -46,10 +43,11 @@ BOT_ACTIVE = True
 signer_keypair = None
 if SOLANA_PRIVATE_KEY:
     try:
-        signer_keypair = Keypair.from_base58_string(SOLANA_PRIVATE_KEY)
+        clean_key = SOLANA_PRIVATE_KEY.strip()
+        signer_keypair = Keypair.from_base58_string(clean_key)
         print(f"🔑 Wallet Connecté : {signer_keypair.pubkey()}")
     except Exception as e:
-        print(f"❌ Erreur Clé Privée : {e}")
+        print(f"❌ Erreur Clé Privée : {e}. Vérifiez la variable SOLANA_PRIVATE_KEY sur Render.")
 
 def check_security_and_score(token_address):
     try:
@@ -111,6 +109,9 @@ async def send_solana_transaction(tx_bytes):
         return None
 
 async def execute_trade(action, token_address, amount):
+    if not signer_keypair:
+        print(f"⚠️ Impossible d'exécuter l'action '{action}' : Wallet non configuré.")
+        return None
     try:
         payload = {
             "publicKey": str(signer_keypair.pubkey()),
@@ -169,7 +170,6 @@ async def listen_new_launches(app):
     global BOT_ACTIVE
     while True:
         try:
-            # ping_interval=20 et ping_timeout=10 maintiennent le canal WebSocket ouvert en permanence
             async with websockets.connect(
                 PUMP_FUN_WS, 
                 ping_interval=20, 
@@ -205,31 +205,49 @@ async def listen_new_launches(app):
                                     await app.bot.send_message(chat_id=CHAT_ID_TARGET, text=msg, parse_mode="Markdown")
                                     asyncio.create_task(monitor_and_auto_sell(app, token_address, setup['symbol'], setup['price_usd']))
                     except websockets.exceptions.ConnectionClosed:
-                        print("🔄 Déconnexion temporaire du flux, reconnexion...")
+                        print("🔄 Déconnexion temporaire WebSocket, reconnexion...")
                         break
+                    except asyncio.CancelledError:
+                        raise
                     except Exception as inner_e:
                         print(f"Erreur traitement token: {inner_e}")
                         continue
 
+        except asyncio.CancelledError:
+            print("🛑 Arrêt propre de la surveillance WebSocket.")
+            break
         except Exception as e:
             print(f"Erreur connexion WebSocket: {e}")
-            await asyncio.sleep(3)
+            try:
+                await asyncio.sleep(3)
+            except asyncio.CancelledError:
+                break
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global BOT_ACTIVE
     BOT_ACTIVE = True
-    await update.message.reply_text("🟢 **Bot Activé !** Flux WebSocket stabilisé.")
+    await update.message.reply_text("🟢 **Bot Activé !** Surveillance en cours.")
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global BOT_ACTIVE
     BOT_ACTIVE = False
-    await update.message.reply_text("🔴 **Bot en Pause !** Aucun achat automatique ne sera fait.")
+    await update.message.reply_text("🔴 **Bot en Pause !** Aucun achat automatique ne sera effectué.")
 
 async def post_init(app):
-    asyncio.create_task(listen_new_launches(app))
+    app.ws_task = asyncio.create_task(listen_new_launches(app))
+
+async def post_shutdown(app):
+    if hasattr(app, "ws_task"):
+        app.ws_task.cancel()
 
 if __name__ == "__main__":
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
+    app = (
+        ApplicationBuilder()
+        .token(TELEGRAM_TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stop", stop))
     print("🤖 Démarrage du bot...")
