@@ -30,8 +30,8 @@ SLIPPAGE_PCT = float(os.environ.get("SLIPPAGE_PCT", "20"))
 PRIORITY_FEE = float(os.environ.get("PRIORITY_FEE", "0.003"))
 
 # PARAMÈTRES DU TRAILING STOP
-INITIAL_SL_PCT = 0.20  # Stop-Loss initial à -20%
-TRAILING_STOP_PCT = 0.15  # Vente si le prix chute de 15% depuis son sommet le plus haut
+INITIAL_SL_PCT = 0.20       # Stop-Loss initial à -20%
+TRAILING_STOP_PCT = 0.15    # Revente si chute de 15% depuis le plus haut sommet
 
 MIN_LIQUIDITY_USD = 10000
 MIN_VOLUME_5M = 3000
@@ -52,6 +52,7 @@ if SOLANA_PRIVATE_KEY:
 
 def check_security_and_score(token_address):
     try:
+        # 1. Vérification DexScreener (Liquidité & Volume)
         dex_res = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{token_address}", timeout=4).json()
         pairs = dex_res.get("pairs", [])
         if not pairs: return None
@@ -61,14 +62,31 @@ def check_security_and_score(token_address):
         volume_5m = pair.get("volume", {}).get("m5", 0)
         price_usd = float(pair.get("priceUsd", 0))
 
+        if liquidity < MIN_LIQUIDITY_USD or volume_5m < MIN_VOLUME_5M: 
+            return None
+
+        # 2. Vérification RugCheck (Mint, Freeze & Verrouillage/Risque Dev)
         rug_res = requests.get(f"https://api.rugcheck.xyz/v1/tokens/{token_address}/report/summary", timeout=4)
         if rug_res.status_code != 200: return None
         
         rug_data = rug_res.json()
-        risks = [r.get("name") for r in rug_data.get("risks", [])]
+        risks = [r.get("name", "") for r in rug_data.get("risks", [])]
 
-        if liquidity < MIN_LIQUIDITY_USD or volume_5m < MIN_VOLUME_5M: return None
-        if "Mint Authority Enabled" in risks or "Freeze Authority Enabled" in risks: return None
+        # Filtre Mint & Freeze Authority
+        if "Mint Authority Enabled" in risks or "Freeze Authority Enabled" in risks: 
+            return None
+
+        # Filtre DEV / Supply Lock : rejet si le Dev ou un seul holder détient une part critique non sécurisée
+        dev_risks = [
+            "Single holder ownership", 
+            "High holder concentration", 
+            "Creator balance high",
+            "Large Amount of LP Unlocked"
+        ]
+        for risk in risks:
+            if any(dev_risk.lower() in risk.lower() for dev_risk in dev_risks):
+                print(f"⚠️ Token rejeté : Risque Dev détecté ({risk})")
+                return None
 
         return {
             "name": pair["baseToken"]["name"],
@@ -78,7 +96,8 @@ def check_security_and_score(token_address):
             "liquidity": liquidity,
             "volume_5m": volume_5m
         }
-    except Exception:
+    except Exception as e:
+        print(f"Erreur check security: {e}")
         return None
 
 async def send_solana_transaction(tx_bytes):
@@ -117,8 +136,7 @@ async def monitor_and_auto_sell(app, token_address, symbol, entry_price):
     peak_price = entry_price
     initial_sl_price = entry_price * (1 - INITIAL_SL_PCT)
 
-    # Surveillance sur 12 minutes (144 cycles de 5 sec)
-    for _ in range(144):
+    for _ in range(144):  # Surveillance 12 min
         await asyncio.sleep(5)
         try:
             res = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{token_address}", timeout=3).json()
@@ -128,17 +146,14 @@ async def monitor_and_auto_sell(app, token_address, symbol, entry_price):
             current_price = float(pairs[0].get("priceUsd", 0))
             if current_price <= 0: continue
 
-            # Mise à jour du prix sommet
             if current_price > peak_price:
                 peak_price = current_price
 
-            # Calcul du Stop-Loss suiveur (15% sous le sommet, ou le SL initial si le prix n'a pas monté)
             trailing_sl_price = max(initial_sl_price, peak_price * (1 - TRAILING_STOP_PCT))
 
             gain_pct = ((current_price - entry_price) / entry_price) * 100
             peak_gain_pct = ((peak_price - entry_price) / entry_price) * 100
 
-            # Déclenchement de la revente si le prix repasse sous le Trailing SL
             if current_price <= trailing_sl_price:
                 tx_hash = await execute_trade("sell", token_address, "100%")
                 
@@ -160,8 +175,7 @@ async def monitor_and_auto_sell(app, token_address, symbol, entry_price):
 
                 await app.bot.send_message(chat_id=CHAT_ID_TARGET, text=msg, parse_mode="Markdown")
                 break
-        except Exception as e:
-            print(f"Erreur monitoring: {e}")
+        except Exception:
             continue
 
 async def listen_new_launches(app):
@@ -189,7 +203,8 @@ async def listen_new_launches(app):
                                 f"🤖 **AUTO-BUY EXÉCUTÉ !**\n\n"
                                 f"💎 **Token:** {setup['name']} (${setup['symbol']})\n"
                                 f"💵 **Montant:** {BUY_AMOUNT_SOL} SOL\n"
-                                f"📈 **Stratégie:** Trailing Stop Active (Suivi des sommets)\n"
+                                f"🔒 **Sécurité:** Dev Lock & RugCheck Validés\n"
+                                f"📈 **Stratégie:** Trailing Stop Active\n"
                                 f"🔗 [Solscan](https://solscan.io/tx/{tx_hash})"
                             )
                             await app.bot.send_message(chat_id=CHAT_ID_TARGET, text=msg, parse_mode="Markdown")
@@ -201,12 +216,12 @@ async def listen_new_launches(app):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global BOT_ACTIVE
     BOT_ACTIVE = True
-    await update.message.reply_text("🟢 **Bot Activé !** Le bot surveille le marché avec la stratégie Trailing Stop.")
+    await update.message.reply_text("🟢 **Bot Activé !** Surveillance avec Trailing Stop et Filtres Dev actifs.")
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global BOT_ACTIVE
     BOT_ACTIVE = False
-    await update.message.reply_text("🔴 **Bot en Pause !** Aucun nouvel achat automatique ne sera effectué.")
+    await update.message.reply_text("🔴 **Bot en Pause !**")
 
 async def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
