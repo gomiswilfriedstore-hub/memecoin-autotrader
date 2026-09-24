@@ -33,9 +33,9 @@ PRIORITY_FEE = float(os.environ.get("PRIORITY_FEE", "0.003"))
 # STRATÉGIE STOP-LOSS : Vente à -15% du prix d'achat initial
 STOP_LOSS_PCT = 0.15  # -15% par rapport au prix d'achat
 
-# NOUVEAUX SEUILS PLUS RÉACTIFS
-MIN_LIQUIDITY_USD = 3000
-MIN_VOLUME_5M = 1000
+# SEUILS ÉQUILIBRÉS (OPTION B)
+MIN_LIQUIDITY_USD = 1000
+MIN_VOLUME_5M = 500
 
 RPC_URL = "https://api.mainnet-beta.solana.com"
 PUMP_FUN_WS = "wss://pumpportal.fun/api/data"
@@ -53,7 +53,7 @@ if SOLANA_PRIVATE_KEY:
 
 def check_security_and_score(token_address):
     try:
-        # 1. Vérification DexScreener (Liquidité & Volume)
+        # 1. Vérification DexScreener (Liquidité $1k & Volume $500)
         dex_res = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{token_address}", timeout=4).json()
         pairs = dex_res.get("pairs", [])
         if not pairs:
@@ -75,11 +75,10 @@ def check_security_and_score(token_address):
         rug_data = rug_res.json()
         risks = [r.get("name", "") for r in rug_data.get("risks", [])]
 
-        # Rejet si le créateur peut imprimer des tokens ou geler les comptes
         if "Mint Authority Enabled" in risks or "Freeze Authority Enabled" in risks: 
             return None
 
-        # PARMÈTRE DE LA VIDÉO : Vérification de la concentration et du verrouillage du Dev
+        # Filtre Dev Lock & Concentration
         dev_risks = [
             "Single holder ownership", 
             "High holder concentration", 
@@ -183,7 +182,6 @@ async def listen_new_launches(app):
                 if "mint" in data and BOT_ACTIVE:
                     token_address = data["mint"]
                     
-                    # Temps d'attente réduit à 2 secondes pour être plus réactif
                     await asyncio.sleep(2)
                     
                     setup = check_security_and_score(token_address)
@@ -209,7 +207,7 @@ async def listen_new_launches(app):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global BOT_ACTIVE
     BOT_ACTIVE = True
-    await update.message.reply_text("🟢 **Bot Activé !** Surveillance ultra-réactive avec filtres Dev Lock & Stop-Loss 15% actifs.")
+    await update.message.reply_text("🟢 **Bot Activé !** Paramètres Option B ($1k liq / $500 vol) actifs.")
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global BOT_ACTIVE
