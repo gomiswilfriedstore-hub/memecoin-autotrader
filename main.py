@@ -12,7 +12,7 @@ from solana.rpc.async_api import AsyncClient
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# Serveur web factice pour compatibilité Render
+# --- SERVEUR KEEP-ALIVE POUR RENDER ---
 def keep_alive():
     port = int(os.environ.get("PORT", 10000))
     server = socketserver.TCPServer(("0.0.0.0", port), http.server.SimpleHTTPRequestHandler)
@@ -20,7 +20,7 @@ def keep_alive():
 
 threading.Thread(target=keep_alive, daemon=True).start()
 
-# CONFIGURATION DU BOT
+# --- CONFIGURATION DE L'ENVIRONNEMENT ---
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID_TARGET = os.environ.get("CHAT_ID")
 SOLANA_PRIVATE_KEY = os.environ.get("SOLANA_PRIVATE_KEY")
@@ -29,9 +29,9 @@ BUY_AMOUNT_SOL = float(os.environ.get("BUY_AMOUNT_SOL", "0.05"))
 SLIPPAGE_PCT = float(os.environ.get("SLIPPAGE_PCT", "20"))
 PRIORITY_FEE = float(os.environ.get("PRIORITY_FEE", "0.003"))
 
-# PARAMÈTRES DU TRAILING STOP
+# Stratégie Trailing Stop
 INITIAL_SL_PCT = 0.20       # Stop-Loss initial à -20%
-TRAILING_STOP_PCT = 0.15    # Revente si chute de 15% depuis le plus haut sommet
+TRAILING_STOP_PCT = 0.15    # Revente si chute de 15% depuis le sommet
 
 MIN_LIQUIDITY_USD = 10000
 MIN_VOLUME_5M = 3000
@@ -50,12 +50,13 @@ if SOLANA_PRIVATE_KEY:
     except Exception as e:
         print(f"❌ Erreur Clé Privée : {e}")
 
+# --- FONCTION DE SÉCURITÉ ---
 def check_security_and_score(token_address):
     try:
-        # 1. Vérification DexScreener (Liquidité & Volume)
         dex_res = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{token_address}", timeout=4).json()
         pairs = dex_res.get("pairs", [])
-        if not pairs: return None
+        if not pairs:
+            return None
         
         pair = pairs[0]
         liquidity = pair.get("liquidity", {}).get("usd", 0)
@@ -65,18 +66,16 @@ def check_security_and_score(token_address):
         if liquidity < MIN_LIQUIDITY_USD or volume_5m < MIN_VOLUME_5M: 
             return None
 
-        # 2. Vérification RugCheck (Mint, Freeze & Verrouillage/Risque Dev)
         rug_res = requests.get(f"https://api.rugcheck.xyz/v1/tokens/{token_address}/report/summary", timeout=4)
-        if rug_res.status_code != 200: return None
+        if rug_res.status_code != 200:
+            return None
         
         rug_data = rug_res.json()
         risks = [r.get("name", "") for r in rug_data.get("risks", [])]
 
-        # Filtre Mint & Freeze Authority
         if "Mint Authority Enabled" in risks or "Freeze Authority Enabled" in risks: 
             return None
 
-        # Filtre DEV / Supply Lock : rejet si le Dev ou un seul holder détient une part critique non sécurisée
         dev_risks = [
             "Single holder ownership", 
             "High holder concentration", 
@@ -85,7 +84,6 @@ def check_security_and_score(token_address):
         ]
         for risk in risks:
             if any(dev_risk.lower() in risk.lower() for dev_risk in dev_risks):
-                print(f"⚠️ Token rejeté : Risque Dev détecté ({risk})")
                 return None
 
         return {
@@ -96,10 +94,10 @@ def check_security_and_score(token_address):
             "liquidity": liquidity,
             "volume_5m": volume_5m
         }
-    except Exception as e:
-        print(f"Erreur check security: {e}")
+    except Exception:
         return None
 
+# --- ENVOI DE TRANSACTION ---
 async def send_solana_transaction(tx_bytes):
     try:
         tx = VersionedTransaction.from_bytes(tx_bytes)
@@ -132,19 +130,22 @@ async def execute_trade(action, token_address, amount):
         print(f"❌ Erreur {action}: {e}")
     return None
 
-async def monitor_and_auto_sell(app, token_address, symbol, entry_price):
+# --- MONITORING ET REVENTE ---
+async def monitor_and_auto_sell(bot, token_address, symbol, entry_price):
     peak_price = entry_price
     initial_sl_price = entry_price * (1 - INITIAL_SL_PCT)
 
-    for _ in range(144):  # Surveillance 12 min
+    for _ in range(144):
         await asyncio.sleep(5)
         try:
             res = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{token_address}", timeout=3).json()
             pairs = res.get("pairs", [])
-            if not pairs: continue
+            if not pairs:
+                continue
 
             current_price = float(pairs[0].get("priceUsd", 0))
-            if current_price <= 0: continue
+            if current_price <= 0:
+                continue
 
             if current_price > peak_price:
                 peak_price = current_price
@@ -173,12 +174,13 @@ async def monitor_and_auto_sell(app, token_address, symbol, entry_price):
                         f"🔗 [Solscan](https://solscan.io/tx/{tx_hash})"
                     )
 
-                await app.bot.send_message(chat_id=CHAT_ID_TARGET, text=msg, parse_mode="Markdown")
+                await bot.send_message(chat_id=CHAT_ID_TARGET, text=msg, parse_mode="Markdown")
                 break
         except Exception:
             continue
 
-async def listen_new_launches(app):
+# --- ECOUTE DES NOUVEAUX TOKENS ---
+async def listen_new_launches(bot):
     global BOT_ACTIVE
     async with websockets.connect(PUMP_FUN_WS) as ws:
         await ws.send(json.dumps({"method": "subscribeNewToken"}))
@@ -207,12 +209,13 @@ async def listen_new_launches(app):
                                 f"📈 **Stratégie:** Trailing Stop Active\n"
                                 f"🔗 [Solscan](https://solscan.io/tx/{tx_hash})"
                             )
-                            await app.bot.send_message(chat_id=CHAT_ID_TARGET, text=msg, parse_mode="Markdown")
-                            asyncio.create_task(monitor_and_auto_sell(app, token_address, setup['symbol'], setup['price_usd']))
+                            await bot.send_message(chat_id=CHAT_ID_TARGET, text=msg, parse_mode="Markdown")
+                            asyncio.create_task(monitor_and_auto_sell(bot, token_address, setup['symbol'], setup['price_usd']))
             except Exception as e:
                 print(f"Erreur WS: {e}")
                 await asyncio.sleep(2)
 
+# --- COMMANDES TELEGRAM ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global BOT_ACTIVE
     BOT_ACTIVE = True
@@ -221,19 +224,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global BOT_ACTIVE
     BOT_ACTIVE = False
-    await update.message.reply_text("🔴 **Bot en Pause !**")
+    await update.message.reply_text("🔴 **Bot en Pause !** Aucun achat automatique ne sera fait.")
 
-async def main():
+def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stop", stop))
 
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()
+    # Lancement du flux WebSocket en tâche de fond dès le démarrage du bot
+    asyncio.get_event_loop().create_task(listen_new_launches(app.bot))
 
-    asyncio.create_task(listen_new_launches(app))
-    await asyncio.Event().wait()
+    print("🤖 Bot Telegram démarré...")
+    app.run_polling()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
