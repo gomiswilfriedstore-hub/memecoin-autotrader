@@ -12,7 +12,7 @@ from solana.rpc.async_api import AsyncClient
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# Serveur web Keep-Alive pour Render (gère le port réutilisé propre)
+# --- 1. SERVEUR KEEP-ALIVE POUR RENDER ---
 class ReusableTCPServer(socketserver.TCPServer):
     allow_reuse_address = True
 
@@ -27,7 +27,7 @@ def keep_alive():
 
 threading.Thread(target=keep_alive, daemon=True).start()
 
-# Variables d'environnement
+# --- 2. CONFIGURATION & VARIABLES D'ENVIRONNEMENT ---
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID_TARGET = os.environ.get("CHAT_ID")
 SOLANA_PRIVATE_KEY = os.environ.get("SOLANA_PRIVATE_KEY")
@@ -46,6 +46,7 @@ PUMP_TRADE_API = "https://pumpportal.fun/api/trade-local"
 
 BOT_ACTIVE = True
 
+# --- 3. INITIALISATION DU PORTEFEUILLE ---
 signer_keypair = None
 if SOLANA_PRIVATE_KEY:
     try:
@@ -55,6 +56,7 @@ if SOLANA_PRIVATE_KEY:
     except Exception as e:
         print(f"❌ Erreur Clé Privée : {e}")
 
+# --- 4. SÉCURITÉ ET FILTRAGE DE TOKEN ---
 def check_security_and_score(token_address):
     try:
         dex_res = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{token_address}", timeout=4).json()
@@ -101,6 +103,7 @@ def check_security_and_score(token_address):
     except Exception:
         return None
 
+# --- 5. EXECUTION DES TRANSACTIONS ---
 async def send_solana_transaction(tx_bytes):
     try:
         tx = VersionedTransaction.from_bytes(tx_bytes)
@@ -136,11 +139,12 @@ async def execute_trade(action, token_address, amount):
         print(f"❌ Erreur {action}: {e}")
     return None
 
+# --- 6. SUIVI DU PRIX ET REVENTE AUTO (STOP-LOSS) ---
 async def monitor_and_auto_sell(app, token_address, symbol, entry_price):
     peak_price = entry_price
     sl_trigger_price = entry_price * (1 - STOP_LOSS_PCT)
 
-    for _ in range(144):
+    for _ in range(144):  # Surveille pendant ~12 minutes max
         await asyncio.sleep(5)
         try:
             res = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{token_address}", timeout=3).json()
@@ -172,27 +176,32 @@ async def monitor_and_auto_sell(app, token_address, symbol, entry_price):
         except Exception:
             continue
 
+# --- 7. ECOUTE WEBSOCKET ---
 async def listen_new_launches(app):
     global BOT_ACTIVE
     while True:
         try:
+            headers = {"User-Agent": "Mozilla/5.0"}
             async with websockets.connect(
                 PUMP_FUN_WS, 
+                additional_headers=headers,
                 ping_interval=20, 
                 ping_timeout=10, 
                 close_timeout=5
             ) as ws:
-                await ws.send(json.dumps({"method": "subscribeNewToken"}))
-                print("⚡ SURVEILLANCE ACTIVE...")
+                subscribe_payload = {"method": "subscribeNewToken"}
+                await ws.send(json.dumps(subscribe_payload))
+                print("⚡ SURVEILLANCE ACTIVE ET STABLE...")
 
                 while True:
                     try:
                         message = await ws.recv()
                         data = json.loads(message)
                         
-                        if "mint" in data and BOT_ACTIVE:
+                        if isinstance(data, dict) and "mint" in data and BOT_ACTIVE:
                             token_address = data["mint"]
-                            await asyncio.sleep(2)
+                            print(f"🎯 Nouveau Token Détecté : {token_address}")
+                            await asyncio.sleep(1.5)
                             
                             setup = await asyncio.to_thread(check_security_and_score, token_address)
 
@@ -211,7 +220,7 @@ async def listen_new_launches(app):
                                     await app.bot.send_message(chat_id=CHAT_ID_TARGET, text=msg, parse_mode="Markdown")
                                     asyncio.create_task(monitor_and_auto_sell(app, token_address, setup['symbol'], setup['price_usd']))
                     except websockets.exceptions.ConnectionClosed:
-                        print("🔄 Déconnexion temporaire WebSocket, reconnexion...")
+                        print("🔄 Déconnexion WebSocket, reconnexion dans 3s...")
                         break
                     except asyncio.CancelledError:
                         raise
@@ -220,7 +229,7 @@ async def listen_new_launches(app):
                         continue
 
         except asyncio.CancelledError:
-            print("🛑 Arrêt propre de la surveillance WebSocket.")
+            print("🛑 Arrêt de la surveillance WebSocket.")
             break
         except Exception as e:
             print(f"Erreur connexion WebSocket: {e}")
@@ -229,6 +238,7 @@ async def listen_new_launches(app):
             except asyncio.CancelledError:
                 break
 
+# --- 8. COMMANDES TELEGRAM & CICLE DE VIE ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global BOT_ACTIVE
     BOT_ACTIVE = True
@@ -247,6 +257,7 @@ async def post_shutdown(app):
     if ws_task:
         ws_task.cancel()
 
+# --- 9. POINT D'ENTRÉE ---
 if __name__ == "__main__":
     app = (
         ApplicationBuilder()
