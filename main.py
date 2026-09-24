@@ -39,6 +39,9 @@ RPC_URL = "https://api.mainnet-beta.solana.com"
 PUMP_FUN_WS = "wss://pumpportal.fun/api/data"
 PUMP_TRADE_API = "https://pumpportal.fun/api/trade-local"
 
+# Variable d'état pour contrôler l'activation du bot
+BOT_ACTIVE = True
+
 signer_keypair = None
 if SOLANA_PRIVATE_KEY:
     try:
@@ -141,6 +144,7 @@ async def monitor_and_auto_sell(app, token_address, symbol, entry_price):
             continue
 
 async def listen_new_launches(app):
+    global BOT_ACTIVE
     async with websockets.connect(PUMP_FUN_WS) as ws:
         await ws.send(json.dumps({"method": "subscribeNewToken"}))
         print("⚡ SURVEILLANCE ACTIVE...")
@@ -150,7 +154,8 @@ async def listen_new_launches(app):
                 message = await ws.recv()
                 data = json.loads(message)
                 
-                if "mint" in data:
+                # N'achète que si le bot est actif
+                if "mint" in data and BOT_ACTIVE:
                     token_address = data["mint"]
                     await asyncio.sleep(4)
                     
@@ -173,11 +178,19 @@ async def listen_new_launches(app):
                 await asyncio.sleep(2)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 Bot Auto-Trader Solana actif.")
+    global BOT_ACTIVE
+    BOT_ACTIVE = True
+    await update.message.reply_text("🟢 **Bot Activé !** Le bot surveille le marché et effectuera des trades automatiques.")
+
+async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global BOT_ACTIVE
+    BOT_ACTIVE = False
+    await update.message.reply_text("🔴 **Bot en Pause !** Aucun nouvel achat automatique ne sera effectué.")
 
 async def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("stop", stop))
 
     await app.initialize()
     await app.start()
