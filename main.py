@@ -29,8 +29,9 @@ BUY_AMOUNT_SOL = float(os.environ.get("BUY_AMOUNT_SOL", "0.05"))
 SLIPPAGE_PCT = float(os.environ.get("SLIPPAGE_PCT", "20"))
 PRIORITY_FEE = float(os.environ.get("PRIORITY_FEE", "0.003"))
 
-TP_MULTIPLIER = float(os.environ.get("TP_MULTIPLIER", "1.70"))  # TP: +70%
-SL_MULTIPLIER = float(os.environ.get("SL_MULTIPLIER", "0.80"))  # SL: -20%
+# PARAMÈTRES DU TRAILING STOP
+INITIAL_SL_PCT = 0.20  # Stop-Loss initial à -20%
+TRAILING_STOP_PCT = 0.15  # Vente si le prix chute de 15% depuis son sommet le plus haut
 
 MIN_LIQUIDITY_USD = 10000
 MIN_VOLUME_5M = 3000
@@ -39,7 +40,6 @@ RPC_URL = "https://api.mainnet-beta.solana.com"
 PUMP_FUN_WS = "wss://pumpportal.fun/api/data"
 PUMP_TRADE_API = "https://pumpportal.fun/api/trade-local"
 
-# Variable d'état pour contrôler l'activation du bot
 BOT_ACTIVE = True
 
 signer_keypair = None
@@ -114,10 +114,11 @@ async def execute_trade(action, token_address, amount):
     return None
 
 async def monitor_and_auto_sell(app, token_address, symbol, entry_price):
-    tp_price = entry_price * TP_MULTIPLIER
-    sl_price = entry_price * SL_MULTIPLIER
+    peak_price = entry_price
+    initial_sl_price = entry_price * (1 - INITIAL_SL_PCT)
 
-    for _ in range(120):
+    # Surveillance sur 12 minutes (144 cycles de 5 sec)
+    for _ in range(144):
         await asyncio.sleep(5)
         try:
             res = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{token_address}", timeout=3).json()
@@ -125,22 +126,42 @@ async def monitor_and_auto_sell(app, token_address, symbol, entry_price):
             if not pairs: continue
 
             current_price = float(pairs[0].get("priceUsd", 0))
+            if current_price <= 0: continue
 
-            if current_price >= tp_price:
+            # Mise à jour du prix sommet
+            if current_price > peak_price:
+                peak_price = current_price
+
+            # Calcul du Stop-Loss suiveur (15% sous le sommet, ou le SL initial si le prix n'a pas monté)
+            trailing_sl_price = max(initial_sl_price, peak_price * (1 - TRAILING_STOP_PCT))
+
+            gain_pct = ((current_price - entry_price) / entry_price) * 100
+            peak_gain_pct = ((peak_price - entry_price) / entry_price) * 100
+
+            # Déclenchement de la revente si le prix repasse sous le Trailing SL
+            if current_price <= trailing_sl_price:
                 tx_hash = await execute_trade("sell", token_address, "100%")
-                await app.bot.send_message(
-                    chat_id=CHAT_ID_TARGET,
-                    text=f"🎯 **TAKE-PROFIT (+70%) !**\n\n🟢 **Token:** ${symbol}\n💰 **Prix:** ${current_price:.8f}\n🔗 [Solscan](https://solscan.io/tx/{tx_hash})"
-                )
+                
+                if peak_gain_pct >= 20:
+                    msg = (
+                        f"🎯 **TRAILING STOP : PROFIT SÉCURISÉ !**\n\n"
+                        f"💎 **Token:** ${symbol}\n"
+                        f"🚀 **Sommet Atteint:** +{peak_gain_pct:.1f}%\n"
+                        f"💰 **Vendu à:** +{gain_pct:.1f}%\n"
+                        f"🔗 [Solscan](https://solscan.io/tx/{tx_hash})"
+                    )
+                else:
+                    msg = (
+                        f"🛑 **STOP-LOSS DÉCLENCHÉ !**\n\n"
+                        f"🔴 **Token:** ${symbol}\n"
+                        f"📉 **Perte:** {gain_pct:.1f}%\n"
+                        f"🔗 [Solscan](https://solscan.io/tx/{tx_hash})"
+                    )
+
+                await app.bot.send_message(chat_id=CHAT_ID_TARGET, text=msg, parse_mode="Markdown")
                 break
-            elif current_price <= sl_price:
-                tx_hash = await execute_trade("sell", token_address, "100%")
-                await app.bot.send_message(
-                    chat_id=CHAT_ID_TARGET,
-                    text=f"🛑 **STOP-LOSS (-20%) !**\n\n🔴 **Token:** ${symbol}\n📉 **Prix:** ${current_price:.8f}\n🔗 [Solscan](https://solscan.io/tx/{tx_hash})"
-                )
-                break
-        except Exception:
+        except Exception as e:
+            print(f"Erreur monitoring: {e}")
             continue
 
 async def listen_new_launches(app):
@@ -154,7 +175,6 @@ async def listen_new_launches(app):
                 message = await ws.recv()
                 data = json.loads(message)
                 
-                # N'achète que si le bot est actif
                 if "mint" in data and BOT_ACTIVE:
                     token_address = data["mint"]
                     await asyncio.sleep(4)
@@ -169,6 +189,7 @@ async def listen_new_launches(app):
                                 f"🤖 **AUTO-BUY EXÉCUTÉ !**\n\n"
                                 f"💎 **Token:** {setup['name']} (${setup['symbol']})\n"
                                 f"💵 **Montant:** {BUY_AMOUNT_SOL} SOL\n"
+                                f"📈 **Stratégie:** Trailing Stop Active (Suivi des sommets)\n"
                                 f"🔗 [Solscan](https://solscan.io/tx/{tx_hash})"
                             )
                             await app.bot.send_message(chat_id=CHAT_ID_TARGET, text=msg, parse_mode="Markdown")
@@ -180,7 +201,7 @@ async def listen_new_launches(app):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global BOT_ACTIVE
     BOT_ACTIVE = True
-    await update.message.reply_text("🟢 **Bot Activé !** Le bot surveille le marché et effectuera des trades automatiques.")
+    await update.message.reply_text("🟢 **Bot Activé !** Le bot surveille le marché avec la stratégie Trailing Stop.")
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global BOT_ACTIVE
