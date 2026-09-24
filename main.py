@@ -12,12 +12,18 @@ from solana.rpc.async_api import AsyncClient
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# Serveur web Keep-Alive pour Render
+# Serveur web Keep-Alive pour Render (gère le port réutilisé propre)
+class ReusableTCPServer(socketserver.TCPServer):
+    allow_reuse_address = True
+
 def keep_alive():
     port = int(os.environ.get("PORT", 10000))
     handler = http.server.SimpleHTTPRequestHandler
-    httpd = socketserver.TCPServer(("0.0.0.0", port), handler)
-    httpd.serve_forever()
+    try:
+        httpd = ReusableTCPServer(("0.0.0.0", port), handler)
+        httpd.serve_forever()
+    except Exception as e:
+        print(f"Note Keep-Alive: {e}")
 
 threading.Thread(target=keep_alive, daemon=True).start()
 
@@ -47,7 +53,7 @@ if SOLANA_PRIVATE_KEY:
         signer_keypair = Keypair.from_base58_string(clean_key)
         print(f"🔑 Wallet Connecté : {signer_keypair.pubkey()}")
     except Exception as e:
-        print(f"❌ Erreur Clé Privée : {e}. Vérifiez la variable SOLANA_PRIVATE_KEY sur Render.")
+        print(f"❌ Erreur Clé Privée : {e}")
 
 def check_security_and_score(token_address):
     try:
@@ -110,7 +116,7 @@ async def send_solana_transaction(tx_bytes):
 
 async def execute_trade(action, token_address, amount):
     if not signer_keypair:
-        print(f"⚠️ Impossible d'exécuter l'action '{action}' : Wallet non configuré.")
+        print(f"⚠️ Impossible d'exécuter {action} : Wallet manquant.")
         return None
     try:
         payload = {
@@ -156,8 +162,8 @@ async def monitor_and_auto_sell(app, token_address, symbol, entry_price):
                 msg = (
                     f"🛑 **STOP-LOSS EXÉCUTÉ !**\n\n"
                     f"🔴 **Token:** ${symbol}\n"
-                    f"🚀 **Plus haut atteint:** +{peak_gain_pct:.1f}%\n"
-                    f"📉 **Perte à la revente:** {gain_pct:.1f}%\n"
+                    f"🚀 **Plus haut:** +{peak_gain_pct:.1f}%\n"
+                    f"📉 **Perte revente:** {gain_pct:.1f}%\n"
                     f"🔗 [Solscan](https://solscan.io/tx/{tx_hash})"
                 )
 
@@ -234,11 +240,12 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔴 **Bot en Pause !** Aucun achat automatique ne sera effectué.")
 
 async def post_init(app):
-    app.ws_task = asyncio.create_task(listen_new_launches(app))
+    app.bot_data["ws_task"] = asyncio.create_task(listen_new_launches(app))
 
 async def post_shutdown(app):
-    if hasattr(app, "ws_task"):
-        app.ws_task.cancel()
+    ws_task = app.bot_data.get("ws_task")
+    if ws_task:
+        ws_task.cancel()
 
 if __name__ == "__main__":
     app = (
