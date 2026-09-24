@@ -32,7 +32,7 @@ PRIORITY_FEE = float(os.environ.get("PRIORITY_FEE", "0.003"))
 
 # Stratégie Trailing Stop
 INITIAL_SL_PCT = 0.20       # Stop-Loss initial (-20%)
-TRAILING_STOP_PCT = 0.15    # Chute de 15% depuis le sommet
+TRAILING_STOP_PCT = 0.25    # Chute de 15% depuis le sommet
 
 MIN_LIQUIDITY_USD = 10000
 MIN_VOLUME_5M = 3000
