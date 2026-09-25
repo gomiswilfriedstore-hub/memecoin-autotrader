@@ -86,7 +86,7 @@ async def send_telegram(text: str):
         logging.error(f"Erreur d'envoi Telegram : {e}")
 
 # ==========================================
-# ENVOI ROBOUSTE VERS RPC PUBLIC (AVEC RETRY)
+# ENVOI ROBUSTE VERS RPC PUBLIC (AVEC RETRY)
 # ==========================================
 
 async def send_raw_tx_to_public_rpc(raw_tx: bytes) -> Optional[str]:
