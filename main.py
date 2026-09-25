@@ -6,6 +6,7 @@ import logging
 import base64
 import aiohttp
 import websockets
+import base58
 
 from aiohttp import web
 from solana.rpc.async_api import AsyncClient
@@ -45,7 +46,7 @@ SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.co
 solana_client = AsyncClient(SOLANA_RPC_URL)
 
 # ==========================================
-# CHARGEMENT DU WALLET
+# CHARGEMENT DU WALLET (CORRIGÉ)
 # ==========================================
 
 def load_wallet() -> Keypair:
@@ -53,12 +54,25 @@ def load_wallet() -> Keypair:
     if not pk_env:
         raise ValueError("❌ Aucune clé privée 'SOLANA_PRIVATE_KEY' trouvée dans les variables Render !")
     
+    # Si la clé est un tableau JSON [12, 34, ...]
     if pk_env.startswith("["):
         secret_key = json.loads(pk_env)
+        if len(secret_key) == 32:
+            return Keypair.from_seed(bytes(secret_key))
         return Keypair.from_bytes(bytes(secret_key))
+    
+    # Si c'est une chaîne Base58 (Phantom / Solflare / format brut)
     else:
-        import base58
-        return Keypair.from_bytes(base58.b58decode(pk_env))
+        try:
+            decoded = base58.b58decode(pk_env)
+            if len(decoded) == 32:
+                return Keypair.from_seed(decoded)
+            elif len(decoded) == 64:
+                return Keypair.from_bytes(decoded)
+            else:
+                return Keypair.from_base58_string(pk_env)
+        except Exception:
+            return Keypair.from_base58_string(pk_env)
 
 # ==========================================
 # FILTRES DE SÉCURITÉ
@@ -138,7 +152,7 @@ async def monitor_position(mint: str, symbol: str):
     while True:
         await asyncio.sleep(1.2)
         
-        current_price = entry_price  # Remplacer par la récupération du vrai prix si nécessaire
+        current_price = entry_price  
         elapsed_time = time.time() - start_time
         
         current_pnl_pct = ((current_price - entry_price) / entry_price) * 100
@@ -164,7 +178,6 @@ async def monitor_position(mint: str, symbol: str):
         # Conditions de sortie
         if current_price <= stop_loss_price or elapsed_time >= MAX_HOLD_TIME_SEC:
             logging.info(f"🎯 [VENTE] Clôture de la position sur {symbol} (PnL: {current_pnl_pct:.2f}%)")
-            # Appel de la fonction de vente ici si nécessaire
             break
 
 # ==========================================
@@ -194,7 +207,6 @@ async def listen_pumpfun_mints():
                     if "params" in data:
                         logs = data["params"]["result"]["value"]["logs"]
                         if any("InitializeMint" in log for log in logs):
-                            # Exemple de données récupérées du log (à parser selon le format de ton RPC)
                             token_mock_data = {"symbol": "TEST", "name": "Test Token", "dev_buy_usd": 10.0}
                             
                             is_valid, reason = validate_token_filters(token_mock_data)
