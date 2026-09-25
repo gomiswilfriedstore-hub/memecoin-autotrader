@@ -16,13 +16,13 @@ from solders.transaction import VersionedTransaction
 # CONFIGURATION & SÉCURITÉ
 # ==========================================
 
-# Variables d'environnement strictes
 PRIVATE_KEY_B58 = os.getenv("SOLANA_PRIVATE_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-HELIUS_RPC_URL = os.getenv("HELIUS_RPC_URL", "https://mainnet.helius-rpc.com/?api-key=VOTRE_API_KEY")
 
-# Vérification critique au démarrage
+# Utilisation du RPC public gratuit officiel de Solana
+SOLANA_PUBLIC_RPC_URL = "https://api.mainnet-beta.solana.com"
+
 if not PRIVATE_KEY_B58:
     sys.exit("[ERREUR FATALE] La variable SOLANA_PRIVATE_KEY est absente. Arrêt du bot pour sécurité.")
 
@@ -42,8 +42,8 @@ MAX_MARKET_CAP_USD = 25000.0     # MCap max ($)
 MIN_VOLUME_5M_USD = 1200.0       # Volume min ($)
 
 TRADE_AMOUNT_SOL = 0.01          # Taille de position par trade
-SLIPPAGE_PCT = 15.0              # Slippage toléré (%)
-PRIORITY_FEE_SOL = 0.002         # Priority Fee (SOL) pour exécution prioritaire
+SLIPPAGE_PCT = 20.0              # Slippage augmenté à 20% pour compenser la lenteur du RPC
+PRIORITY_FEE_SOL = 0.003         # Frais de priorité ajustés pour passer sur RPC public
 TRAILING_STOP_PCT = 15.0         # Trailing Stop (%)
 MAX_POSITIONS = 3                # Positions simultanées max
 STAGNATION_SECONDS = 300         # Vente si stagnation > 5 min
@@ -52,7 +52,7 @@ STAGNATION_SECONDS = 300         # Vente si stagnation > 5 min
 # ÉTAT GLOBAL & RESSOURCES SYSTEME
 # ==========================================
 positions: Dict[str, Dict[str, Any]] = {}
-scanned_tokens: Dict[str, float] = {}  # Mint -> Timestamp pour nettoyage
+scanned_tokens: Dict[str, float] = {}
 scanned_count = 0
 HTTP_SESSION: Optional[aiohttp.ClientSession] = None
 
@@ -63,13 +63,13 @@ logging.basicConfig(
 )
 
 # ==========================================
-# CLIENT HTTP REUTILISABLE & TELEGRAM
+# CLIENT HTTP & TELEGRAM
 # ==========================================
 
 async def get_http_session() -> aiohttp.ClientSession:
     global HTTP_SESSION
     if HTTP_SESSION is None or HTTP_SESSION.closed:
-        timeout = aiohttp.ClientTimeout(total=8)
+        timeout = aiohttp.ClientTimeout(total=12)
         HTTP_SESSION = aiohttp.ClientSession(timeout=timeout)
     return HTTP_SESSION
 
@@ -81,17 +81,46 @@ async def send_telegram(text: str):
     try:
         session = await get_http_session()
         async with session.post(url, json=payload) as resp:
-            if resp.status != 200:
-                logging.warning(f"Échec envoi Telegram : status {resp.status}")
+            pass
     except Exception as e:
         logging.error(f"Erreur d'envoi Telegram : {e}")
+
+# ==========================================
+# ENVOI ROBOUSTE VERS RPC PUBLIC (AVEC RETRY)
+# ==========================================
+
+async def send_raw_tx_to_public_rpc(raw_tx: bytes) -> Optional[str]:
+    """Envoie la transaction signée au RPC public avec gestion de réessais."""
+    session = await get_http_session()
+    rpc_payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "sendTransaction",
+        "params": [
+            base58.b58encode(raw_tx).decode("utf-8"),
+            {"encoding": "base58", "skipPreflight": True, "maxRetries": 5}
+        ]
+    }
+    
+    # 3 tentatives en cas de blocage du RPC public
+    for attempt in range(3):
+        try:
+            async with session.post(SOLANA_PUBLIC_RPC_URL, json=rpc_payload) as rpc_resp:
+                res_json = await rpc_resp.json()
+                if "result" in res_json:
+                    return res_json['result']
+                elif "error" in res_json:
+                    logging.warning(f"Avertissement RPC (tentative {attempt + 1}) : {res_json['error']}")
+        except Exception as e:
+            logging.warning(f"Erreur réseau RPC (tentative {attempt + 1}) : {e}")
+        await asyncio.sleep(1)
+    return None
 
 # ==========================================
 # EXÉCUTION DES TRANSACTIONS ON-CHAIN
 # ==========================================
 
 async def execute_real_buy(mint: str, sol_amount: float) -> bool:
-    """Génère, signe localement et envoie l'ordre d'achat."""
     url = "https://pumpportal.fun/api/trade-local"
     payload = {
         "publicKey": PUBLIC_KEY_STR,
@@ -112,33 +141,20 @@ async def execute_real_buy(mint: str, sol_amount: float) -> bool:
                 tx = VersionedTransaction.deserialize(tx_bytes)
                 tx.sign([KEYPAIR])
 
-                raw_tx = bytes(tx)
-                rpc_payload = {
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "sendTransaction",
-                    "params": [
-                        base58.b58encode(raw_tx).decode("utf-8"),
-                        {"encoding": "base58", "skipPreflight": True}
-                    ]
-                }
-                async with session.post(HELIUS_RPC_URL, json=rpc_payload) as rpc_resp:
-                    res_json = await rpc_resp.json()
-                    if "result" in res_json:
-                        tx_hash = res_json['result']
-                        logging.info(f"✅ BUY EXÉCUTÉ - Tx: https://solscan.io/tx/{tx_hash}")
-                        return True
-                    else:
-                        logging.error(f"❌ Rejet RPC Achat : {res_json}")
+                tx_hash = await send_raw_tx_to_public_rpc(bytes(tx))
+                if tx_hash:
+                    logging.info(f"✅ BUY EXÉCUTÉ - Tx: https://solscan.io/tx/{tx_hash}")
+                    return True
+                else:
+                    logging.error("❌ Échec envoi transaction sur le RPC public.")
             else:
                 err_text = await resp.text()
-                logging.error(f"❌ Échec API PumpPortal Achat ({resp.status}) : {err_text}")
+                logging.error(f"❌ Échec PumpPortal ({resp.status}) : {err_text}")
     except Exception as e:
         logging.error(f"❌ Exception lors de l'achat de {mint} : {e}")
     return False
 
 async def execute_real_sell(mint: str, percentage_str: str = "100%") -> bool:
-    """Génère, signe localement et envoie l'ordre de vente."""
     url = "https://pumpportal.fun/api/trade-local"
     payload = {
         "publicKey": PUBLIC_KEY_STR,
@@ -159,33 +175,21 @@ async def execute_real_sell(mint: str, percentage_str: str = "100%") -> bool:
                 tx = VersionedTransaction.deserialize(tx_bytes)
                 tx.sign([KEYPAIR])
 
-                raw_tx = bytes(tx)
-                rpc_payload = {
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "sendTransaction",
-                    "params": [
-                        base58.b58encode(raw_tx).decode("utf-8"),
-                        {"encoding": "base58", "skipPreflight": True}
-                    ]
-                }
-                async with session.post(HELIUS_RPC_URL, json=rpc_payload) as rpc_resp:
-                    res_json = await rpc_resp.json()
-                    if "result" in res_json:
-                        tx_hash = res_json['result']
-                        logging.info(f"✅ SELL EXÉCUTÉ - Tx: https://solscan.io/tx/{tx_hash}")
-                        return True
-                    else:
-                        logging.error(f"❌ Rejet RPC Vente : {res_json}")
+                tx_hash = await send_raw_tx_to_public_rpc(bytes(tx))
+                if tx_hash:
+                    logging.info(f"✅ SELL EXÉCUTÉ - Tx: https://solscan.io/tx/{tx_hash}")
+                    return True
+                else:
+                    logging.error("❌ Échec envoi vente sur le RPC public.")
             else:
                 err_text = await resp.text()
-                logging.error(f"❌ Échec API PumpPortal Vente ({resp.status}) : {err_text}")
+                logging.error(f"❌ Échec PumpPortal Vente ({resp.status}) : {err_text}")
     except Exception as e:
         logging.error(f"❌ Exception lors de la vente de {mint} : {e}")
     return False
 
 # ==========================================
-# ANALYSE DU MARKET DATA
+# ANALYSE ET MONITORING
 # ==========================================
 
 async def fetch_dexscreener_data(mint: str) -> Optional[Dict[str, Any]]:
@@ -198,8 +202,8 @@ async def fetch_dexscreener_data(mint: str) -> Optional[Dict[str, Any]]:
                 pairs = data.get("pairs")
                 if pairs:
                     return pairs[0]
-    except Exception as e:
-        logging.debug(f"Données DexScreener non disponibles pour {mint}: {e}")
+    except Exception:
+        pass
     return None
 
 async def evaluate_after_delay(mint: str, symbol: str):
@@ -224,21 +228,19 @@ async def evaluate_after_delay(mint: str, symbol: str):
     except (ValueError, TypeError):
         return
 
-    # Validation stricts selon les filtres
     if liquidity_usd < MIN_LIQUIDITY_USD:
         return
     if not (MIN_MARKET_CAP_USD <= market_cap <= MAX_MARKET_CAP_USD):
         return
     if volume_5m < MIN_VOLUME_5M_USD:
         return
-    if buys < (sells * 1.2):  # Minimum 20% plus d'acheteurs que de vendeurs
+    if buys < (sells * 1.2):
         return
 
-    # Vérifications des slots
     if len(positions) >= MAX_POSITIONS or mint in positions:
         return
 
-    logging.info(f"🎯 Opportunité détectée : {symbol} ({mint[:6]}...) - Achat de {TRADE_AMOUNT_SOL} SOL")
+    logging.info(f"🎯 Opportunité détectée : {symbol} ({mint[:6]}...)")
     
     buy_success = await execute_real_buy(mint, TRADE_AMOUNT_SOL)
     if buy_success:
@@ -252,17 +254,12 @@ async def evaluate_after_delay(mint: str, symbol: str):
         }
 
         msg = (
-            f"🚀 **ACHAT LIVE EXÉCUTÉ**\n"
-            f"• **Token :** {symbol} (`{mint[:6]}...`)\n"
+            f"🚀 **ACHAT LIVE (RPC PUBLIC)**\n"
+            f"• **Token :** {symbol}\n"
             f"• **Prix Entrée :** ${price_usd:.8f}\n"
-            f"• **Liq :** ${liquidity_usd:,.0f} \vert{} **MCap :**${market_cap:,.0f}\n"
-            f"• **Vol 5m :** ${volume_5m:,.0f}"
+            f"• **Liq :** ${liquidity_usd:,.0f} \vert{} **MCap :**${market_cap:,.0f}"
         )
         await send_telegram(msg)
-
-# ==========================================
-# GESTION DES POSITIONS & MONITORING
-# ==========================================
 
 async def update_position_price(mint: str, current_price: float):
     if mint not in positions:
@@ -280,14 +277,12 @@ async def update_position_price(mint: str, current_price: float):
     
     stop_level = highest * (1 - (TRAILING_STOP_PCT / 100.0))
 
-    # Condition 1: Trailing Stop
     should_sell_stop = (current_price <= stop_level) and (highest > entry)
-    # Condition 2: Stagnation longue en profit
     should_sell_stagnation = (now - pos["last_peak_time"] > STAGNATION_SECONDS) and (current_price > entry)
 
     if should_sell_stop or should_sell_stagnation:
         reason = "Trailing Stop (-15%)" if should_sell_stop else "Stagnation (+5 min)"
-        logging.info(f"⚠️ Sortie position ({reason}) sur {pos['symbol']}...")
+        logging.info(f"⚠️ Vente ({reason}) sur {pos['symbol']}...")
         
         sell_success = await execute_real_sell(mint, "100%")
         if sell_success:
@@ -295,7 +290,7 @@ async def update_position_price(mint: str, current_price: float):
             pnl_sol = TRADE_AMOUNT_SOL * (pnl_pct / 100)
 
             msg = (
-                f"🔴 **VENTE LIVE EXÉCUTÉE**\n"
+                f"🔴 **VENTE LIVE (RPC PUBLIC)**\n"
                 f"• **Token :** {pos['symbol']}\n"
                 f"• **Raison :** {reason}\n"
                 f"• **PnL :** `{pnl_pct:+.2f}%` ({pnl_sol:+.4f} SOL)"
@@ -304,7 +299,6 @@ async def update_position_price(mint: str, current_price: float):
             del positions[mint]
 
 async def position_monitor():
-    """Boucle de contrôle des positions ouvertes."""
     while True:
         await asyncio.sleep(2)
         for mint in list(positions.keys()):
@@ -318,7 +312,6 @@ async def position_monitor():
                     continue
 
 async def memory_cleanup_loop():
-    """Purge l'historique des tokens analysés toutes les heures."""
     while True:
         await asyncio.sleep(3600)
         now = time.time()
@@ -336,7 +329,7 @@ async def websocket_loop():
         try:
             session = await get_http_session()
             async with session.ws_connect(uri, heartbeat=15) as ws:
-                logging.info("⚡ Connecté au Flux WebSocket PumpPortal (Mode Live)")
+                logging.info("⚡ Connecté au WebSocket (Mode RPC Public)")
                 await ws.send_json({"method": "subscribeNewToken"})
 
                 async for msg in ws:
@@ -351,7 +344,7 @@ async def websocket_loop():
                                 asyncio.create_task(evaluate_after_delay(mint, symbol))
 
         except Exception as e:
-            logging.error(f"Déconnexion WS, nouvelle tentative dans 3s : {e}")
+            logging.error(f"Reconnexion WS dans 3s : {e}")
             await asyncio.sleep(3)
 
 # ==========================================
@@ -361,9 +354,9 @@ async def websocket_loop():
 async def handle_health(request):
     return web.json_response({
         "status": "online",
+        "rpc_type": "public_free",
         "account": PUBLIC_KEY_STR,
-        "active_positions": len(positions),
-        "total_scanned": scanned_count
+        "active_positions": len(positions)
     })
 
 async def start_web_server():
@@ -379,7 +372,7 @@ async def start_web_server():
 # ==========================================
 
 async def main():
-    logging.info(f"Bot démarré avec le compte Solana : {PUBLIC_KEY_STR}")
+    logging.info(f"Bot démarré avec RPC Public. Compte : {PUBLIC_KEY_STR}")
     await start_web_server()
     asyncio.create_task(position_monitor())
     asyncio.create_task(memory_cleanup_loop())
@@ -389,4 +382,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logging.info("Bot arrêté manuellement.")
+        logging.info("Bot arrêté.")
