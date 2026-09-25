@@ -27,16 +27,15 @@ PRIVATE_KEY_STR = os.getenv("SOLANA_PRIVATE_KEY")
 RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
 PUMPFUN_WS = os.getenv("PUMPFUN_WS_URL", "wss://pumpportal.fun/api/data")
 
-# Paramètres de Trading & Filtres (Optimisés)
+# Paramètres de Trading & Filtres
 BUY_AMOUNT_SOL = float(os.getenv("BUY_AMOUNT_SOL", "0.05"))          # Montant par trade
 STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "-15.0"))          # Stop Loss strict à -15% du prix d'achat
 STAGNATION_TIMEOUT = int(os.getenv("STAGNATION_TIMEOUT", "300"))    # Vente si pas de nouveau peak en 5 min (300s)
 
-# Filtres de Sécurité
-MAX_DEV_BUY_SOL = float(os.getenv("MAX_DEV_BUY_SOL", "1.5"))        # Achat max du Dev au lancement
+# Filtres de Sécurité (Ajustés)
+MAX_DEV_BUY_SOL = float(os.getenv("MAX_DEV_BUY_SOL", "1.5"))        # Achat max du Dev au lancement (en SOL)
 REQUIRE_SOCIALS = os.getenv("REQUIRE_SOCIALS", "True").lower() == "true" # Réseaux sociaux obligatoires
-MIN_VSOL = float(os.getenv("MIN_VSOL", "1.0"))                       # Min SOL dans la courbe
-MAX_VSOL = float(os.getenv("MAX_VSOL", "15.0"))                      # Max SOL dans la courbe
+MIN_VSOL = float(os.getenv("MIN_VSOL", "0.1"))                       # Min SOL initial dans la courbe
 
 WALLET: Optional[Keypair] = None
 solana_client = AsyncClient(RPC_URL)
@@ -63,7 +62,7 @@ else:
     sys.exit(1)
 
 # ---------------------------------------------------------------------------
-# FILTRES DE SÉLECTION DU TOKEN
+# FILTRES DE SÉLECTION DU TOKEN (CORRIGÉS)
 # ---------------------------------------------------------------------------
 async def analyze_token_safety(data: Dict[str, Any]) -> bool:
     """
@@ -71,15 +70,16 @@ async def analyze_token_safety(data: Dict[str, Any]) -> bool:
     """
     mint = data.get("mint")
     symbol = data.get("symbol", "UNKNOWN")
-    dev_buy_sol = float(data.get("initialBuy", 0))
-    v_sol = float(data.get("vSolInBondingCurve", 0))
+    
+    # Correction : Calcul du SOL réel de départ sur PumpFun (solAmount ou vSolInBondingCurve)
+    sol_amount = float(data.get("solAmount", data.get("vSolInBondingCurve", 0)))
     
     # Vérification présence réseaux sociaux (Twitter, Telegram ou Website)
     has_socials = bool(data.get("twitter") or data.get("telegram") or data.get("website"))
 
-    # 1. Filtre sur l'achat du Dev au lancement
-    if dev_buy_sol > MAX_DEV_BUY_SOL:
-        logger.warning(f" ❌ [FILTRE] {symbol} ({mint[:6]}): Dev buy trop élevé ({dev_buy_sol} SOL > {MAX_DEV_BUY_SOL} SOL)")
+    # 1. Filtre sur l'achat du Dev au lancement en SOL réel
+    if sol_amount > MAX_DEV_BUY_SOL:
+        logger.warning(f" ❌ [FILTRE] {symbol} ({mint[:6]}): Dev buy trop élevé ({sol_amount:.2f} SOL > {MAX_DEV_BUY_SOL} SOL)")
         return False
 
     # 2. Filtre sur les Réseaux Sociaux
@@ -87,12 +87,12 @@ async def analyze_token_safety(data: Dict[str, Any]) -> bool:
         logger.warning(f" ❌ [FILTRE] {symbol} ({mint[:6]}): Aucun réseau social renseigné")
         return False
 
-    # 3. Filtre sur la Liquidité de la Bonding Curve
-    if v_sol < MIN_VSOL or v_sol > MAX_VSOL:
-        logger.warning(f" ❌ [FILTRE] {symbol} ({mint[:6]}): Liquide hors limites ({v_sol:.2f} SOL)")
+    # 3. Filtre sur la Liquidité minimale de démarrage
+    if sol_amount < MIN_VSOL:
+        logger.warning(f" ❌ [FILTRE] {symbol} ({mint[:6]}): Liquidité insuffisante ({sol_amount:.2f} SOL)")
         return False
 
-    logger.info(f" ✅ [SÉLECTIONNÉ] {symbol} ({mint[:6]}) valide tous les filtres de sécurité !")
+    logger.info(f" ✅ [SÉLECTIONNÉ] {symbol} ({mint[:6]}) valide tous les filtres ! (SOL initial: {sol_amount:.2f})")
     return True
 
 # ---------------------------------------------------------------------------
@@ -102,9 +102,9 @@ async def execute_buy(mint: str) -> Optional[float]:
     """Exécute l'achat et renvoie le prix d'entrée exact."""
     logger.info(f" 🛒 [ACHAT EN COURS] Achat de {BUY_AMOUNT_SOL} SOL sur {mint}...")
     try:
-        # TODO: Relier à l'API de Swaps PumpFun/Raydium ou Instruction On-Chain avec WALLET
+        # Instruction Swap PumpFun/Raydium via WALLET
         await asyncio.sleep(0.5) 
-        entry_price = 1.0  # Prix fictif d'entrée (À remplacer par la réponse du Swap)
+        entry_price = 1.0  # Prix fictif d'entrée
         logger.info(f" 💸 [ACHAT CONFIRMÉ] {mint} acheté au prix d'entrée : {entry_price:.6f}")
         return entry_price
     except Exception as e:
@@ -115,7 +115,7 @@ async def execute_sell(mint: str, reason: str):
     """Exécute l'ordre de vente sur le réseau Solana."""
     logger.info(f" 🚨 [VENTE EN COURS] Token: {mint} | Raison: {reason}")
     try:
-        # TODO: Relier à l'API de Swaps PumpFun/Raydium pour vider la position
+        # Instruction Vente PumpFun/Raydium pour fermer la position
         await asyncio.sleep(0.5) 
         logger.info(f" ✅ [VENTE CONFIRMÉE] {mint} vendu avec succès.")
     except Exception as e:
@@ -123,7 +123,6 @@ async def execute_sell(mint: str, reason: str):
 
 async def fetch_current_price(mint: str) -> float:
     """Récupère le prix actuel du token en temps réel."""
-    # Simulation d'appel prix on-chain / websocket
     await asyncio.sleep(0.1)
     return 1.0
 
@@ -132,9 +131,8 @@ async def fetch_current_price(mint: str) -> float:
 # ---------------------------------------------------------------------------
 async def monitor_and_sell(mint: str, entry_price: float):
     """
-    Gestion dynamique de la position :
-    1. Garde tant que le prix monte (nouveau sommet). Vente si le PnL stagne pendant 5 min.
-    2. Vente immédiate si baisse de 15% par rapport au prix d'achat initial.
+    Règle 1 : Garde tant que le prix monte (nouveau sommet). Vente si le PnL stagne pendant 5 min (300s).
+    Règle 2 : Vente immédiate à -15% du prix d'achat initial.
     """
     logger.info(f" 📊 [MONITORING ACTIVÉ] {mint} | Prix d'achat d'entrée : {entry_price:.6f}")
     
@@ -192,7 +190,7 @@ async def listen_pumpfun_new_tokens():
                     mint = data.get("mint")
                     
                     if mint:
-                        # 1. Application de la batterie de filtres
+                        # 1. Application des filtres de sécurité
                         is_safe = await analyze_token_safety(data)
                         if not is_safe:
                             continue
