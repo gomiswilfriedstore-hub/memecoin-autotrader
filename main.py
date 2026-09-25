@@ -2,6 +2,7 @@ import os
 import time
 import asyncio
 import logging
+from aiohttp import web
 
 # Configuration des Logs
 logging.basicConfig(
@@ -16,7 +17,7 @@ logging.basicConfig(
 
 BUY_AMOUNT_USD = float(os.getenv("BUY_AMOUNT_USD", "2.50"))      # Mise fixe par trade
 REQUIRE_SOCIALS = os.getenv("REQUIRE_SOCIALS", "False").lower() == "true"
-MAX_DEV_BUY_USD = float(os.getenv("MAX_DEV_BUY_USD", "100.0"))    # Réduit à $100 pour plus de sécurité
+MAX_DEV_BUY_USD = float(os.getenv("MAX_DEV_BUY_USD", "100.0"))    # Sécurité anti-dev dump
 
 # GESTION DES RISQUES & TRAILING PROGRESSIF
 INITIAL_STOP_LOSS_PCT = -15.0  # Perte max initiale (~$0.37)
@@ -41,18 +42,15 @@ def validate_token_filters(token_data: dict) -> tuple[bool, str]:
     dev_buy_usd = float(token_data.get("dev_buy_usd", 0.0))
     has_socials = bool(token_data.get("twitter") or token_data.get("telegram") or token_data.get("website"))
 
-    # 1. Filtre Spam / Noms génériques
     if symbol in BANNED_NAMES or any(banned in name for banned in BANNED_NAMES if len(banned) > 2):
         return False, f"Nom/Symbole suspect ('{symbol}')"
 
     if len(name) < 2 or len(symbol) < 2:
         return False, "Nom ou symbole trop court"
 
-    # 2. Filtre Réseaux Sociaux (Optionnel)
     if REQUIRE_SOCIALS and not has_socials:
         return False, "Aucun réseau social"
 
-    # 3. Filtre Anti-Dev Dump ($100 max)
     if dev_buy_usd > MAX_DEV_BUY_USD:
         return False, f"Achat initial Dev trop élevé (${dev_buy_usd:.2f} > ${MAX_DEV_BUY_USD:.2f})"
 
@@ -83,7 +81,6 @@ async def execute_trade(token_data: dict):
     while True:
         await asyncio.sleep(1.2)  # Fréquence de scan de 1.2 seconde
         
-        # Récupération du prix actuel via ton WebSocket ou RPC
         current_price = entry_price  # Remplace par float(get_current_price(mint))
         elapsed_time = time.time() - start_time
         
@@ -97,7 +94,7 @@ async def execute_trade(token_data: dict):
 
         # 2. Sécurisation "Breakeven" dès qu'on touche +30%
         if peak_pnl_pct >= BREAKEVEN_TRIGGER_PCT and not breakeven_secured:
-            breakeven_price = entry_price * 1.02  # Prix d'entrée + 2% pour couvrir les frais de gaz
+            breakeven_price = entry_price * 1.02  # Prix d'entrée + 2% (frais)
             if breakeven_price > stop_loss_price:
                 stop_loss_price = breakeven_price
                 breakeven_secured = True
@@ -134,24 +131,30 @@ async def execute_trade(token_data: dict):
             break
 
 # ==========================================
-# BOUCLE PRINCIPALE
+# SERVEUR HTTP POUR RENDER & BOUCLE PRINCIPALE
 # ==========================================
 
-async def process_new_token(token_data: dict):
-    mint = token_data.get("mint", "UNKNOWN")
-    symbol = token_data.get("symbol", "N/A")
+async def handle_health_check(request):
+    return web.Response(text="Bot PumpFun actif et opérationnel 🚀")
 
-    is_valid, reason = validate_token_filters(token_data)
-
-    if not is_valid:
-        logging.warning(f"❌ [FILTRE] {symbol} ({mint[:6]}): {reason}")
-        return
-
-    logging.info(f"✅ [ÉLIGIBLE] Token {symbol} ({mint[:6]}) validé !")
-    await execute_trade(token_data)
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get('/', handle_health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    
+    port = int(os.getenv("PORT", 10000))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    logging.info(f"🌐 Mini-serveur HTTP démarré sur le port {port} (Anti-timeout Render)")
 
 async def main():
     logging.info("🚀 Bot PumpFun démarré en mode ÉQUILIBRÉ (SÉCURITÉ & RENTABILITÉ)")
+    
+    # Lancement du serveur Web en arrière-plan pour satisfaire Render
+    await start_web_server()
+
+    # Boucle principale du bot
     while True:
         await asyncio.sleep(1)
 
