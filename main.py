@@ -1,36 +1,64 @@
 import os
+import json
 import time
 import asyncio
 import logging
-from aiohttp import web
+import base64
+import aiohttp
+import websockets
 
-# Configuration des Logs
+from aiohttp import web
+from solana.rpc.async_api import AsyncClient
+from solders.keypair import Keypair
+from solders.transaction import VersionedTransaction
+
+# ==========================================
+# CONFIGURATION DES LOGS & ENVIRONNEMENT
+# ==========================================
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S"
 )
 
-# ==========================================
-# CONFIGURATION OPTIMISÉE & ÉQUILIBRÉE
-# ==========================================
-
-BUY_AMOUNT_USD = float(os.getenv("BUY_AMOUNT_USD", "2.50"))      # Mise fixe par trade
+# Paramètres de Trading & Risques
+BUY_AMOUNT_SOL = float(os.getenv("BUY_AMOUNT_SOL", "0.01"))      # Montant par trade en SOL (~$2.50)
 REQUIRE_SOCIALS = os.getenv("REQUIRE_SOCIALS", "False").lower() == "true"
-MAX_DEV_BUY_USD = float(os.getenv("MAX_DEV_BUY_USD", "100.0"))    # Sécurité anti-dev dump
+MAX_DEV_BUY_USD = float(os.getenv("MAX_DEV_BUY_USD", "100.0"))    # Anti-dev dump
 
-# GESTION DES RISQUES & TRAILING PROGRESSIF
-INITIAL_STOP_LOSS_PCT = -15.0  # Perte max initiale (~$0.37)
-BASE_TRAILING_PCT = 18.0       # Distance sous le peak au début (18%)
-WIDE_TRAILING_PCT = 25.0       # Distance élargie à 25% si le token dépasse +50% de hausse
-BREAKEVEN_TRIGGER_PCT = 30.0   # À +30%, le stop monte au prix d'entrée + frais (+2%)
-MAX_HOLD_TIME_SEC = 180        # Timeout ramené à 3 minutes
+# Gestion des Stops & PnL
+INITIAL_STOP_LOSS_PCT = -15.0  # Perte max initiale
+BASE_TRAILING_PCT = 18.0       # Distance trailing standard (18%)
+WIDE_TRAILING_PCT = 25.0       # Distance trailing si gros pump (>50%)
+BREAKEVEN_TRIGGER_PCT = 30.0   # Remontée du SL à l'entrée + frais à +30%
+MAX_HOLD_TIME_SEC = 180        # Timeout de sécurité (3 minutes)
 
-# Blacklist renforcée des spams et tokens suspects
+# Blacklist de noms suspects
 BANNED_NAMES = [
     "YO", "TEST", "PUMP", "SOL", "UNKNOWN", "NULL", "MOON", 
     "MEME", "COIN", "DOGE", "PEPE", "SHIB", "DEV", "ANON", "INU", "ELON"
 ]
+
+PUMPFUN_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
+solana_client = AsyncClient(SOLANA_RPC_URL)
+
+# ==========================================
+# CHARGEMENT DU WALLET
+# ==========================================
+
+def load_wallet() -> Keypair:
+    pk_env = os.getenv("SOLANA_PRIVATE_KEY")
+    if not pk_env:
+        raise ValueError("❌ Aucune clé privée 'SOLANA_PRIVATE_KEY' trouvée dans les variables Render !")
+    
+    if pk_env.startswith("["):
+        secret_key = json.loads(pk_env)
+        return Keypair.from_bytes(bytes(secret_key))
+    else:
+        import base58
+        return Keypair.from_bytes(base58.b58decode(pk_env))
 
 # ==========================================
 # FILTRES DE SÉCURITÉ
@@ -52,86 +80,138 @@ def validate_token_filters(token_data: dict) -> tuple[bool, str]:
         return False, "Aucun réseau social"
 
     if dev_buy_usd > MAX_DEV_BUY_USD:
-        return False, f"Achat initial Dev trop élevé (${dev_buy_usd:.2f} > ${MAX_DEV_BUY_USD:.2f})"
+        return False, f"Achat initial Dev trop élevé (${dev_buy_usd:.2f})"
 
     return True, "Filtres validés"
 
 # ==========================================
-# MOTEUR D'EXÉCUTION & TRAILING ADAPTATIF
+# EXÉCUTION DES TRADES (ACHAT & SUIVI)
 # ==========================================
 
-async def execute_trade(token_data: dict):
-    mint = token_data.get("mint")
-    symbol = token_data.get("symbol")
-    
-    logging.info(f"🛒 [ACHAT] Ordre de ${BUY_AMOUNT_USD:.2f} sur {symbol} ({mint[:8]}...)")
-    
-    # Place ton instruction d'achat Web3 / PumpFun SDK ici
-    # await buy_token(mint, BUY_AMOUNT_USD)
-    
-    entry_price = float(token_data.get("initial_price", 1.0))
+async def execute_buy_order(mint_str: str, wallet: Keypair) -> bool:
+    try:
+        url = "https://pumpportal.fun/api/trade-local"
+        payload = {
+            "publicKey": str(wallet.pubkey()),
+            "action": "buy",
+            "mint": mint_str,
+            "denominatedInSol": "true",
+            "amount": BUY_AMOUNT_SOL,
+            "slippage": 15,
+            "priorityFee": 0.0005,
+            "pool": "pump"
+        }
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload) as resp:
+                if resp.status != 200:
+                    logging.error(f"❌ Erreur API PumpPortal: {await resp.text()}")
+                    return False
+                tx_bytes = await resp.read()
+
+        tx = VersionedTransaction.from_bytes(tx_bytes)
+        signed_tx = VersionedTransaction(tx.message, [wallet])
+
+        tx_sig = await solana_client.send_raw_transaction(
+            bytes(signed_tx),
+            opts={"skip_preflight": True, "max_retries": 2}
+        )
+        
+        logging.info(f"🚀 [ACHAT] Tx envoyée! https://solscan.io/tx/{str(tx_sig.value)}")
+        return True
+
+    except Exception as e:
+        logging.error(f"❌ Exception lors de l'achat de {mint_str}: {e}")
+        return False
+
+async def monitor_position(mint: str, symbol: str):
+    """Gère le Trailing Stop, le Breakeven et le Timeout en arrière-plan"""
+    entry_price = 1.0  # Valeur de référence initiale
     highest_price = entry_price
     start_time = time.time()
     
     stop_loss_price = entry_price * (1 + (INITIAL_STOP_LOSS_PCT / 100.0))
     breakeven_secured = False
 
-    logging.info(f"✅ [EXÉCUTÉ] {symbol} | Prix Entrée: {entry_price:.6f} | SL Initial: {stop_loss_price:.6f}")
+    logging.info(f"🛡️ [SUIVI] Position ouverte sur {symbol} | SL Initial: {stop_loss_price:.4f}")
 
     while True:
-        await asyncio.sleep(1.2)  # Fréquence de scan de 1.2 seconde
+        await asyncio.sleep(1.2)
         
-        current_price = entry_price  # Remplace par float(get_current_price(mint))
+        current_price = entry_price  # Remplacer par la récupération du vrai prix si nécessaire
         elapsed_time = time.time() - start_time
         
         current_pnl_pct = ((current_price - entry_price) / entry_price) * 100
         peak_pnl_pct = ((highest_price - entry_price) / entry_price) * 100
 
-        # 1. Mise à jour du plus haut historique (ATH Local)
         if current_price > highest_price:
             highest_price = current_price
             peak_pnl_pct = ((highest_price - entry_price) / entry_price) * 100
 
-        # 2. Sécurisation "Breakeven" dès qu'on touche +30%
+        # Breakeven à +30%
         if peak_pnl_pct >= BREAKEVEN_TRIGGER_PCT and not breakeven_secured:
-            breakeven_price = entry_price * 1.02  # Prix d'entrée + 2% (frais)
-            if breakeven_price > stop_loss_price:
-                stop_loss_price = breakeven_price
-                breakeven_secured = True
-                logging.info(f"🛡️ [BREAKEVEN] {symbol} a atteint +{peak_pnl_pct:.1f}% ! Capital sécurisé (SL remonté à +2%).")
+            stop_loss_price = entry_price * 1.02
+            breakeven_secured = True
+            logging.info(f"🛡️ [BREAKEVEN] {symbol} sécurisé à l'entrée +2%.")
 
-        # 3. Calcul de la distance du Trailing Stop selon la hausse atteinte
-        if peak_pnl_pct >= 50.0:
-            active_trailing_distance = WIDE_TRAILING_PCT  # 25% si gros pump
-        else:
-            active_trailing_distance = BASE_TRAILING_PCT  # 18% par défaut
-
-        # 4. Ajustement dynamique du Trailing Stop
+        # Trailing dynamique
+        active_trailing = WIDE_TRAILING_PCT if peak_pnl_pct >= 50.0 else BASE_TRAILING_PCT
         if peak_pnl_pct > 0:
-            new_stop_loss = highest_price * (1 - (active_trailing_distance / 100.0))
-            if new_stop_loss > stop_loss_price:
-                stop_loss_price = new_stop_loss
-                logging.info(f"📈 [TRAILING -> {symbol}] Peak: +{peak_pnl_pct:.1f}% | Stop suiveur (-{active_trailing_distance}%): {stop_loss_price:.6f}")
+            new_stop = highest_price * (1 - (active_trailing / 100.0))
+            if new_stop > stop_loss_price:
+                stop_loss_price = new_stop
 
-        # 5. Condition de sortie : Prix passe sous le Stop
-        if current_price <= stop_loss_price:
-            if current_pnl_pct >= 0:
-                logging.info(f"🎯 [PROFIT] Vente de {symbol} ! Gain net: +{current_pnl_pct:.2f}%")
-            else:
-                logging.warning(f"🛑 [STOP LOSS] Vente de {symbol} ! Perte: {current_pnl_pct:.2f}%")
-            
-            # Place ton instruction de vente Web3 / PumpFun SDK ici
-            # await sell_token(mint)
-            break
-
-        # 6. Condition de sortie : Timeout 3 minutes
-        if elapsed_time >= MAX_HOLD_TIME_SEC:
-            logging.info(f"⏱️ [TIMEOUT 3M] Stagnation sur {symbol} (PnL: {current_pnl_pct:.2f}%). Vente !")
-            # await sell_token(mint)
+        # Conditions de sortie
+        if current_price <= stop_loss_price or elapsed_time >= MAX_HOLD_TIME_SEC:
+            logging.info(f"🎯 [VENTE] Clôture de la position sur {symbol} (PnL: {current_pnl_pct:.2f}%)")
+            # Appel de la fonction de vente ici si nécessaire
             break
 
 # ==========================================
-# SERVEUR HTTP POUR RENDER & BOUCLE PRINCIPALE
+# WEBSOCKET PUMPFUN (ÉCOUTE DES TOKENS)
+# ==========================================
+
+async def listen_pumpfun_mints():
+    wallet = load_wallet()
+    uri = os.getenv("SOLANA_WSS_URI", "wss://mainnet.helius-rpc.com/?api-key=TON_API_KEY")
+    
+    while True:
+        try:
+            async with websockets.connect(uri) as websocket:
+                sub_payload = {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "logsSubscribe",
+                    "params": [{"mentions": [PUMPFUN_PROGRAM_ID]}, {"commitment": "processed"}]
+                }
+                await websocket.send(json.dumps(sub_payload))
+                logging.info("🔗 Connecté au WebSocket Solana - Écoute des lancements PumpFun...")
+
+                while True:
+                    response = await websocket.recv()
+                    data = json.loads(response)
+                    
+                    if "params" in data:
+                        logs = data["params"]["result"]["value"]["logs"]
+                        if any("InitializeMint" in log for log in logs):
+                            # Exemple de données récupérées du log (à parser selon le format de ton RPC)
+                            token_mock_data = {"symbol": "TEST", "name": "Test Token", "dev_buy_usd": 10.0}
+                            
+                            is_valid, reason = validate_token_filters(token_mock_data)
+                            if is_valid:
+                                mint_address = "AdresseRecupereeDuLog..."
+                                success = await execute_buy_order(mint_address, wallet)
+                                if success:
+                                    asyncio.create_task(monitor_position(mint_address, token_mock_data["symbol"]))
+                            else:
+                                logging.info(f"🛑 Token ignoré : {reason}")
+
+        except Exception as e:
+            logging.error(f"⚠️ Erreur WebSocket ({e}). Reconnexion dans 3s...")
+            await asyncio.sleep(3)
+
+# ==========================================
+# SERVEUR HTTP RENDER & INITIALISATION
 # ==========================================
 
 async def handle_health_check(request):
@@ -146,17 +226,14 @@ async def start_web_server():
     port = int(os.getenv("PORT", 10000))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
-    logging.info(f"🌐 Mini-serveur HTTP démarré sur le port {port} (Anti-timeout Render)")
+    logging.info(f"🌐 Mini-serveur HTTP actif sur le port {port}")
 
 async def main():
     logging.info("🚀 Bot PumpFun démarré en mode ÉQUILIBRÉ (SÉCURITÉ & RENTABILITÉ)")
-    
-    # Lancement du serveur Web en arrière-plan pour satisfaire Render
-    await start_web_server()
-
-    # Boucle principale du bot
-    while True:
-        await asyncio.sleep(1)
+    await asyncio.gather(
+        start_web_server(),
+        listen_pumpfun_mints()
+    )
 
 if __name__ == "__main__":
     asyncio.run(main())
