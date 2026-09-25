@@ -3,3 +3,9 @@ requests
 websockets
 solders
 solana
+aiohttp
+base58
+solders
+solana
+python-telegram-bot
+requests
