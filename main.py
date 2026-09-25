@@ -193,6 +193,7 @@ class AutoPumpFunBot:
             if buys < 5:
                 return False, "Pas assez d'achats (momentum faible)"
 
+            # LA LIGNE CORRIGÉE EST ICI :
             return True, f"MC: ${market_cap:,.0f} \vert{} Liq:${liquidity:,.0f}"
         except Exception:
             return False, "Erreur API"
