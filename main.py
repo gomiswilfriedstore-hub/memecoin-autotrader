@@ -9,6 +9,7 @@ import aiohttp
 from aiohttp import web
 import websockets
 import base58
+from collections import OrderedDict
 
 from solana.rpc.async_api import AsyncClient
 from solders.keypair import Keypair
@@ -32,18 +33,14 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S"
 )
 
-# Paramètres de Trading : Montant fixé à 0.02 SOL
+# Vos paramètres inchangés
 BUY_AMOUNT_SOL = 0.02  
-
-# Sécurité Holders Minimum
-MIN_HOLDERS_REQUIRED = 100  # Le token doit avoir au moins 100 détenteurs après l'achat
-
-# Gestion des Stops & PnL
+MIN_HOLDERS_REQUIRED = 100  
 INITIAL_STOP_LOSS_PCT = -10.0  
 BASE_TRAILING_PCT = 10.0       
 WIDE_TRAILING_PCT = 20.0       
 BREAKEVEN_TRIGGER_PCT = 25.0   
-MAX_HOLD_TIME_SEC = 180        # 3 minutes maximum de détention (stagnation)
+MAX_HOLD_TIME_SEC = 180        
 
 # Blacklist affinée
 BANNED_NAMES = [
@@ -58,7 +55,11 @@ SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://mainnet.helius-rpc.com/?ap
 solana_client = AsyncClient(SOLANA_RPC_URL)
 
 trade_semaphore = asyncio.Semaphore(2)
-processed_tokens = set()
+
+# Optimisation : Cache intelligent à taille limitée pour éviter les fuites de mémoire
+processed_tokens = OrderedDict()
+MAX_PROCESSED_CACHE = 1000
+
 active_positions_count = 0
 
 # ==========================================
@@ -132,24 +133,24 @@ def parse_pumpfun_event(program_data_hex):
         return None
 
 # ==========================================
-# RÉCUPÉRATION DES MÉTRIQUES DE MARCHÉ
+# RÉCUPÉRATION DES MÉTRIQUES DE MARCHÉ (ROBUSTE)
 # ==========================================
 
 async def fetch_token_market_data(mint: str) -> dict:
     clean_mint = mint.strip().replace("\n", "").replace("\r", "")
     url = f"https://pumpportal.fun/api/data/token/{clean_mint}"
     
-    for attempt in range(3):
+    for attempt in range(4): # 4 essais pour contrer les micro-latences réseau
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=3) as resp:
+                async with session.get(url, timeout=3.5) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         if data and isinstance(data, dict) and len(data) > 0:
                             return data
         except Exception:
             pass
-        await asyncio.sleep(0.8)
+        await asyncio.sleep(0.6)
         
     return {}
 
@@ -170,7 +171,11 @@ def validate_token_quick(token_data: dict) -> tuple[bool, str]:
     if upper_symbol in BANNED_NAMES or any(banned in upper_name for banned in BANNED_NAMES if len(banned) > 2):
         return False, f"Nom/Symbole suspect ('{symbol}')"
 
-    processed_tokens.add(mint)
+    # Gestion de la taille du cache (mémoire optimisée)
+    processed_tokens[mint] = True
+    if len(processed_tokens) > MAX_PROCESSED_CACHE:
+        processed_tokens.popitem(last=False)
+
     return True, "Nom valide"
 
 # ==========================================
@@ -246,13 +251,19 @@ async def monitor_position(mint: str, symbol: str, wallet: Keypair):
     active_positions_count += 1
     clean_mint = mint.strip().replace("\n", "").replace("\r", "")
     
-    # Pause de 5 secondes pour laisser le temps aux holders d'arriver
+    # Attente de 5 secondes (inchangée)
     await asyncio.sleep(5.0)
     
     market_data = await fetch_token_market_data(clean_mint)
+    
+    # Sécurité anti-bug : si l'API est brièvement injoignable, on retente une fois avant de rejeter
+    if not market_data:
+        await asyncio.sleep(1.0)
+        market_data = await fetch_token_market_data(clean_mint)
+
     holders_count = int(market_data.get("holders", 0) or 0)
     
-    # VENTE D'URGENCE SI MOINS DE 100 DÉTENTEURS
+    # Sécurité Holders (100 min)
     if holders_count < MIN_HOLDERS_REQUIRED:
         logging.warning(f"🛑 [SÉCURITÉ HOLDERS] {symbol} rejeté : Seulement {holders_count} détenteur(s) (Minimum requis : {MIN_HOLDERS_REQUIRED}). Vente immédiate...")
         await execute_trade(clean_mint, wallet, "sell")
@@ -308,17 +319,18 @@ async def monitor_position(mint: str, symbol: str, wallet: Keypair):
         logging.info(f"💼 Position fermée. Solde actuel du wallet : {new_balance:.4f} SOL")
 
 # ==========================================
-# WEBSOCKET PUMPFUN
+# WEBSOCKET PUMPFUN (AVEC BACKOFF EXPONENTIEL)
 # ==========================================
 
 async def listen_pumpfun_mints():
     wallet = load_wallet()
-    
     uri = os.getenv("SOLANA_WSS_URI", "wss://mainnet.helius-rpc.com/?api-key=7d50ec7c-921b-4281-8eb7-4d1b1e5f61a2")
     
+    reconnect_delay = 3
     while True:
         try:
             async with websockets.connect(uri) as websocket:
+                reconnect_delay = 3 # Réinitialise le délai si la connexion réussit
                 sub_payload = {
                     "jsonrpc": "2.0",
                     "id": 1,
@@ -326,7 +338,7 @@ async def listen_pumpfun_mints():
                     "params": [{"mentions": [PUMPFUN_PROGRAM_ID]}, {"commitment": "processed"}]
                 }
                 await websocket.send(json.dumps(sub_payload))
-                logging.info("🔗 Connecté au WebSocket Solana - Mode Sécurité 100+ Holders & Attente 5s Actif...")
+                logging.info("🔗 Connecté au WebSocket Solana - Mode Robuste Actif...")
 
                 while True:
                     response = await websocket.recv()
@@ -363,15 +375,16 @@ async def listen_pumpfun_mints():
                                         pass
 
         except Exception as e:
-            logging.error(f"⚠️ Erreur WebSocket ({e}). Reconnexion dans 3s...")
-            await asyncio.sleep(3)
+            logging.error(f"⚠️ Erreur WebSocket ({e}). Reconnexion dans {reconnect_delay}s...")
+            await asyncio.sleep(reconnect_delay)
+            reconnect_delay = min(reconnect_delay * 2, 30) # Backoff exponentiel plafonné à 30s
 
 # ==========================================
 # SERVEUR HTTP & MAIN
 # ==========================================
 
 async def handle_health_check(request):
-    return web.Response(text="Bot PumpFun Sécurité 100 Holders (5s / 180s) Actif 🚀")
+    return web.Response(text="Bot PumpFun Haute Fiabilité Actif 🚀")
 
 async def start_web_server():
     app = web.Application()
@@ -385,7 +398,7 @@ async def start_web_server():
     logging.info(f"🌐 Mini-serveur HTTP actif sur le port {port}")
 
 async def main():
-    logging.info("🚀 Bot PumpFun démarré - Mode Achat Instantané + Filtre 100+ Détenteurs (5s check, 3m hold max)")
+    logging.info("🚀 Bot PumpFun démarré - Version Ultra-Fiable sans changement de paramètres")
     await asyncio.gather(
         start_web_server(),
         listen_pumpfun_mints()
