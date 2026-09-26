@@ -6,14 +6,17 @@ import logging
 import base64
 import struct
 import aiohttp
+from aiohttp import web
 import websockets
 import base58
 
 from solana.rpc.async_api import AsyncClient
+from solders.keypair import Keypair
+from solders.pubkey import Pubkey
+from solders.transaction import VersionedTransaction
 
 # ==========================================
 # NETTOYAGE GLOBAL DES VARIABLES D'ENVIRONNEMENT
-# (Éradique les \n cachés dans les configs Render)
 # ==========================================
 for env_key, env_val in list(os.environ.items()):
     if isinstance(env_val, str):
