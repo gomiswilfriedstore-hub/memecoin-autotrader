@@ -34,7 +34,11 @@ logging.basicConfig(
 
 # Paramètres de Trading & Optimisation Marché
 BUY_AMOUNT_SOL = float(os.getenv("BUY_AMOUNT_SOL", "0.02"))  
-MAX_DEV_BUY_USD = float(os.getenv("MAX_DEV_BUY_USD", "50.0"))  
+
+# Filtres de Marché Avancés (Liquidité & MarketCap en USD)
+MIN_MARKET_CAP_USD = float(os.getenv("MIN_MARKET_CAP_USD", "1000.0"))  
+MAX_MARKET_CAP_USD = float(os.getenv("MAX_MARKET_CAP_USD", "45000.0")) 
+MIN_VOLUME_USD = float(os.getenv("MIN_VOLUME_USD", "200.0"))           
 
 # Gestion des Stops & PnL
 INITIAL_STOP_LOSS_PCT = -10.0  
@@ -55,10 +59,7 @@ PUMPFUN_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://mainnet.helius-rpc.com/?api-key=7d50ec7c-921b-4281-8eb7-4d1b1e5f61a2")
 solana_client = AsyncClient(SOLANA_RPC_URL)
 
-# Sémaphore pour éviter les surcharges RPC (Rate limits)
 trade_semaphore = asyncio.Semaphore(2)
-
-# Mémoire globale Anti-Doublons (Stocke les adresses Mints déjà traitées)
 processed_tokens = set()
 
 # ==========================================
@@ -135,57 +136,65 @@ def parse_pumpfun_event(program_data_hex):
         return None
 
 # ==========================================
-# VÉRIFICATION DES LIENS SOCIAUX (API PUMPPORTAL)
+# RÉCUPÉRATION DES MÉTRIQUES DE MARCHÉ & SOCIAUX
 # ==========================================
 
-async def verify_token_socials(mint: str) -> bool:
-    """Interroge l'API PumpPortal pour vérifier si le token possède de vrais liens sociaux (Twitter/Telegram/Site)."""
+async def fetch_token_market_data(mint: str) -> dict:
     try:
         clean_mint = mint.strip().replace("\n", "").replace("\r", "")
         url = f"https://pumpportal.fun/api/data/token/{clean_mint}"
         async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=3) as resp:
                 if resp.status == 200:
-                    data = await resp.json()
-                    twitter = data.get("twitter")
-                    telegram = data.get("telegram")
-                    website = data.get("website")
-                    
-                    # Retourne True si au moins un réseau social est présent
-                    if bool(twitter or telegram or website):
-                        return True
+                    return await resp.json()
     except Exception:
         pass
-    return False
+    return {}
 
 # ==========================================
-# FILTRES DE SÉCURITÉ & ANTI-DOUBLONS
+# FILTRES DE SÉCURITÉ, MARCHÉ & ANTI-DOUBLONS
 # ==========================================
 
 async def validate_token_filters(token_data: dict) -> tuple[bool, str]:
-    symbol = token_data.get("symbol", "").upper().strip()
-    name = token_data.get("name", "").upper().strip()
+    symbol = token_data.get("symbol", "").strip()
+    name = token_data.get("name", "").strip()
     mint = token_data.get("mint", "").strip()
 
-    # 1. RÈGLE ANTI-DOUBLON (Évite d'acheter deux fois le même token)
+    # 1. RÈGLE ANTI-DOUBLON
     if mint in processed_tokens:
         return False, "Token déjà traité ou acheté (Anti-Doublon)"
 
-    # 2. RÈGLE BLACKLIST / MOTS SUSPECTS
-    if symbol in BANNED_NAMES or any(banned in name for banned in BANNED_NAMES if len(banned) > 2):
+    # 2. RÈGLE BLACKLIST / MOTS SUSPECTS (Pas de filtre de longueur de nom ici)
+    upper_symbol = symbol.upper()
+    upper_name = name.upper()
+    if upper_symbol in BANNED_NAMES or any(banned in upper_name for banned in BANNED_NAMES if len(banned) > 2):
         return False, f"Nom/Symbole suspect ('{symbol}')"
 
-    if len(name) < 2 or len(symbol) < 2:
-        return False, "Nom ou symbole trop court"
+    # 3. RÉCUPÉRATION DES DONNÉES DE MARCHÉ & RÉSEAUX VIA API
+    market_data = await fetch_token_market_data(mint)
+    if not market_data:
+        return False, "Impossible de récupérer les métriques du token (API injoignable)"
 
-    # 3. VÉRIFICATION DES RÉSEAUX SOCIAUX VIA API
-    has_socials = await verify_token_socials(mint)
-    if not has_socials:
-        return False, "Aucun réseau social détecté (Potentiel Rug/Bot)"
+    # Vérification des réseaux sociaux (Sécurité Anti-Rug)
+    twitter = market_data.get("twitter")
+    telegram = market_data.get("telegram")
+    website = market_data.get("website")
+    if not (twitter or telegram or website):
+        return False, "Aucun réseau social détecté (Potentiel Rug)"
+
+    # 4. FILTRES DE RENTABILITÉ : MARKET CAP & VOLUME
+    market_cap = float(market_data.get("marketCap", market_data.get("usd_market_cap", 0)) or 0)
+    volume = float(market_data.get("v_usd", market_data.get("volume", 0)) or 0)
+
+    if market_cap > 0:
+        if market_cap < MIN_MARKET_CAP_USD:
+            return False, f"Market Cap trop faible ({market_cap}$ < {MIN_MARKET_CAP_USD}$)"
+        if market_cap > MAX_MARKET_CAP_USD:
+            return False, f"Market Cap trop élevée ({market_cap}$ > {MAX_MARKET_CAP_USD}$)"
 
     # Marquer comme traité pour l'anti-doublon
     processed_tokens.add(mint)
-    return True, "Filtres et Réseaux validés avec succès"
+    return True, f"Validé (MCap: {market_cap}$, Vol: {volume}$)"
 
 # ==========================================
 # EXÉCUTION DES TRADES (ACHAT / VENTE)
@@ -252,17 +261,8 @@ async def execute_trade(mint_str: str, wallet: Keypair, action: str, amount_val=
             return False
 
 async def fetch_token_price(mint: str) -> float:
-    try:
-        clean_mint = mint.strip().replace("\n", "").replace("\r", "")
-        url = f"https://pumpportal.fun/api/data/token/{clean_mint}"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=2) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return float(data.get("price", 1.0))
-    except Exception:
-        pass
-    return 1.0
+    data = await fetch_token_market_data(mint)
+    return float(data.get("price", 1.0) or 1.0)
 
 async def monitor_position(mint: str, symbol: str, wallet: Keypair):
     clean_mint = mint.strip().replace("\n", "").replace("\r", "")
@@ -329,7 +329,7 @@ async def listen_pumpfun_mints():
                     "params": [{"mentions": [PUMPFUN_PROGRAM_ID]}, {"commitment": "processed"}]
                 }
                 await websocket.send(json.dumps(sub_payload))
-                logging.info("🔗 Connecté au WebSocket Solana - Filtres Avancés & Anti-Doublons Actifs...")
+                logging.info("🔗 Connecté au WebSocket Solana - Filtres MarketCap & Sécurité Actifs...")
 
                 while True:
                     response = await websocket.recv()
@@ -352,10 +352,9 @@ async def listen_pumpfun_mints():
                                             symbol = token_info['symbol'].strip()
                                             name = token_info['name'].strip()
                                             
-                                            # Validation asynchrone (Anti-doublons + Réseaux sociaux)
                                             is_valid, reason = await validate_token_filters(token_info)
                                             if is_valid:
-                                                logging.info(f"🚀 TOKEN VALIDÉ & SÉCURISÉ ! {name} ({symbol})")
+                                                logging.info(f"🚀 TOKEN VALIDÉ ({reason}) ! {name} ({symbol})")
                                                 success = await execute_trade(mint_address, wallet, "buy", BUY_AMOUNT_SOL)
                                                 if success:
                                                     asyncio.create_task(monitor_position(mint_address, symbol, wallet))
@@ -373,7 +372,7 @@ async def listen_pumpfun_mints():
 # ==========================================
 
 async def handle_health_check(request):
-    return web.Response(text="Bot PumpFun Sécurité/Rentabilité Actif 🚀")
+    return web.Response(text="Bot PumpFun Optimisé (MarketCap/Volume) Actif 🚀")
 
 async def start_web_server():
     app = web.Application()
@@ -387,7 +386,7 @@ async def start_web_server():
     logging.info(f"🌐 Mini-serveur HTTP actif sur le port {port}")
 
 async def main():
-    logging.info("🚀 Bot PumpFun démarré - Mode Anti-Rug & Anti-Doublons")
+    logging.info("🚀 Bot PumpFun démarré - Mode Rentabilité & Sécurité")
     await asyncio.gather(
         start_web_server(),
         listen_pumpfun_mints()
