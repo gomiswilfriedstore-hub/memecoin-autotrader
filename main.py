@@ -141,7 +141,7 @@ async def execute_buy_order(mint_str: str, wallet: Keypair) -> bool:
         payload = {
             "publicKey": str(wallet.pubkey()),
             "action": "buy",
-            "mint": mint_str.strip(),  # Nettoyage des espaces/retours à la ligne
+            "mint": mint_str.strip(),
             "denominatedInSol": "true",
             "amount": BUY_AMOUNT_SOL,
             "slippage": 15,
@@ -151,17 +151,14 @@ async def execute_buy_order(mint_str: str, wallet: Keypair) -> bool:
 
         async with aiohttp.ClientSession() as session:
             async with session.post(url, json=payload) as resp:
-                response_text = await resp.text()
                 if resp.status != 200:
-                    logging.error(f"❌ Erreur API PumpPortal: {response_text}")
+                    # En cas d'erreur HTTP, on peut lire le texte pour logger le message d'erreur de l'API
+                    error_text = await resp.text()
+                    logging.error(f"❌ Erreur API PumpPortal: {error_text}")
                     return False
                 
-                # Nettoyage et décodage robuste de la réponse
-                tx_bytes = response_text.strip().encode('utf-8')
-                try:
-                    raw_data = base64.b64decode(tx_bytes)
-                except Exception:
-                    raw_data = await resp.read()
+                # Récupération directe des octets binaires de la transaction (évite les erreurs UTF-8)
+                raw_data = await resp.read()
 
         tx = VersionedTransaction.from_bytes(raw_data)
         signed_tx = VersionedTransaction(tx.message, [wallet])
