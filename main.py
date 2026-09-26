@@ -57,6 +57,9 @@ solana_client = AsyncClient(SOLANA_RPC_URL)
 trade_semaphore = asyncio.Semaphore(2)
 processed_tokens = set()
 
+# Compteur pour suivre le nombre de positions actives simultanées
+active_positions_count = 0
+
 # ==========================================
 # CHARGEMENT DU WALLET
 # ==========================================
@@ -88,9 +91,6 @@ async def check_wallet_balance(wallet: Keypair) -> float:
         balance_resp = await solana_client.get_balance(wallet.pubkey())
         lamports = balance_resp.value if hasattr(balance_resp, "value") else balance_resp.get("result", {}).get("value", 0)
         sol_balance = lamports / 1e9
-        logging.info(f"💰 Solde du Wallet ({wallet.pubkey()}) : {sol_balance:.4f} SOL")
-        if sol_balance < BUY_AMOUNT_SOL:
-            logging.warning(f"⚠️ ATTENTION : Solde insuffisant (< {BUY_AMOUNT_SOL} SOL). Rechargez votre wallet !")
         return sol_balance
     except Exception as e:
         logging.error(f"❌ Impossible de récupérer le solde du wallet : {e}")
@@ -131,7 +131,7 @@ def parse_pumpfun_event(program_data_hex):
         return None
 
 # ==========================================
-# RÉCUPÉRATION DES MÉTRIQUES DE MARCHÉ (POUR LE SUIVI)
+# RÉCUPÉRATION DES MÉTRIQUES DE MARCHÉ
 # ==========================================
 
 async def fetch_token_market_data(mint: str) -> dict:
@@ -153,7 +153,7 @@ async def fetch_token_market_data(mint: str) -> dict:
     return {}
 
 # ==========================================
-# FILTRE RAPIDE (ANTI-BLACKLIST UNIQUEMENT)
+# FILTRE RAPIDE (ANTI-BLACKLIST)
 # ==========================================
 
 def validate_token_quick(token_data: dict) -> tuple[bool, str]:
@@ -177,11 +177,12 @@ def validate_token_quick(token_data: dict) -> tuple[bool, str]:
 # ==========================================
 
 async def execute_trade(mint_str: str, wallet: Keypair, action: str, amount_val=None) -> bool:
+    global active_positions_count
     async with trade_semaphore:
         try:
             current_balance = await check_wallet_balance(wallet)
             if current_balance < BUY_AMOUNT_SOL and action == "buy":
-                logging.error(f"❌ Achat annulé : Solde de SOL insuffisant (< {BUY_AMOUNT_SOL} SOL).")
+                logging.error(f"❌ Achat annulé : Solde de SOL insuffisant ({current_balance:.4f} SOL < {BUY_AMOUNT_SOL} SOL).")
                 return False
 
             clean_mint = mint_str.strip().replace("\n", "").replace("\r", "")
@@ -241,9 +242,10 @@ async def fetch_token_price(mint: str) -> float:
     return float(data.get("price", 1.0) or 1.0)
 
 async def monitor_position(mint: str, symbol: str, wallet: Keypair):
+    global active_positions_count
+    active_positions_count += 1
     clean_mint = mint.strip().replace("\n", "").replace("\r", "")
     
-    # Petite pause pour laisser le temps à l'API de référencer le prix d'entrée
     await asyncio.sleep(2.0)
     entry_price = await fetch_token_price(clean_mint)
     if entry_price <= 0:
@@ -255,38 +257,43 @@ async def monitor_position(mint: str, symbol: str, wallet: Keypair):
     stop_loss_price = entry_price * (1 + (INITIAL_STOP_LOSS_PCT / 100.0))
     breakeven_secured = False
 
-    logging.info(f"🛡️ [SUIVI] Position active sur {symbol} | Entrée: {entry_price} | SL Initial: {stop_loss_price:.4f}")
+    logging.info(f"🛡️ [SUIVI] Position active sur {symbol} | Entrée: {entry_price} | SL Initial: {stop_loss_price:.4f} | Positions actives: {active_positions_count}")
 
-    while True:
-        await asyncio.sleep(1.0) 
-        current_price = await fetch_token_price(clean_mint)
-        elapsed_time = time.time() - start_time
-        
-        if current_price <= 0:
-            continue
+    try:
+        while True:
+            await asyncio.sleep(1.0) 
+            current_price = await fetch_token_price(clean_mint)
+            elapsed_time = time.time() - start_time
+            
+            if current_price <= 0:
+                continue
 
-        current_pnl_pct = ((current_price - entry_price) / entry_price) * 100
-        peak_pnl_pct = ((highest_price - entry_price) / entry_price) * 100
-
-        if current_price > highest_price:
-            highest_price = current_price
+            current_pnl_pct = ((current_price - entry_price) / entry_price) * 100
             peak_pnl_pct = ((highest_price - entry_price) / entry_price) * 100
 
-        if peak_pnl_pct >= BREAKEVEN_TRIGGER_PCT and not breakeven_secured:
-            stop_loss_price = entry_price * 1.01  
-            breakeven_secured = True
-            logging.info(f"🛡️ [BREAKEVEN] {symbol} sécurisé à l'entrée.")
+            if current_price > highest_price:
+                highest_price = current_price
+                peak_pnl_pct = ((highest_price - entry_price) / entry_price) * 100
 
-        active_trailing = WIDE_TRAILING_PCT if peak_pnl_pct >= 100.0 else BASE_TRAILING_PCT
-        if peak_pnl_pct > 0:
-            new_stop = highest_price * (1 - (active_trailing / 100.0))
-            if new_stop > stop_loss_price:
-                stop_loss_price = new_stop
+            if peak_pnl_pct >= BREAKEVEN_TRIGGER_PCT and not breakeven_secured:
+                stop_loss_price = entry_price * 1.01  
+                breakeven_secured = True
+                logging.info(f"🛡️ [BREAKEVEN] {symbol} sécurisé à l'entrée.")
 
-        if current_price <= stop_loss_price or elapsed_time >= MAX_HOLD_TIME_SEC:
-            logging.info(f"⚡ [CLÔTURE] {symbol} - PnL: {current_pnl_pct:.2f}% | Temps: {elapsed_time:.1f}s")
-            await execute_trade(clean_mint, wallet, "sell")
-            break
+            active_trailing = WIDE_TRAILING_PCT if peak_pnl_pct >= 100.0 else BASE_TRAILING_PCT
+            if peak_pnl_pct > 0:
+                new_stop = highest_price * (1 - (active_trailing / 100.0))
+                if new_stop > stop_loss_price:
+                    stop_loss_price = new_stop
+
+            if current_price <= stop_loss_price or elapsed_time >= MAX_HOLD_TIME_SEC:
+                logging.info(f"⚡ [CLÔTURE] {symbol} - PnL: {current_pnl_pct:.2f}% | Temps: {elapsed_time:.1f}s")
+                await execute_trade(clean_mint, wallet, "sell")
+                break
+    finally:
+        active_positions_count = max(0, active_positions_count - 1)
+        new_balance = await check_wallet_balance(wallet)
+        logging.info(f"💼 Position fermée. Solde actuel du wallet : {new_balance:.4f} SOL | Positions restantes : {active_positions_count}")
 
 # ==========================================
 # WEBSOCKET PUMPFUN
@@ -294,7 +301,6 @@ async def monitor_position(mint: str, symbol: str, wallet: Keypair):
 
 async def listen_pumpfun_mints():
     wallet = load_wallet()
-    await check_wallet_balance(wallet)
     
     uri = os.getenv("SOLANA_WSS_URI", "wss://mainnet.helius-rpc.com/?api-key=7d50ec7c-921b-4281-8eb7-4d1b1e5f61a2")
     
@@ -308,7 +314,7 @@ async def listen_pumpfun_mints():
                     "params": [{"mentions": [PUMPFUN_PROGRAM_ID]}, {"commitment": "processed"}]
                 }
                 await websocket.send(json.dumps(sub_payload))
-                logging.info("🔗 Connecté au WebSocket Solana - Achat direct instantané actif...")
+                logging.info("🔗 Connecté au WebSocket Solana - Mode Gestion Intelligente du Solde Actif...")
 
                 while True:
                     response = await websocket.recv()
@@ -319,6 +325,12 @@ async def listen_pumpfun_mints():
                         logs_str = "".join(logs)
                         
                         if "Instruction: InitializeMint" in logs_str or "Instruction: Create" in logs_str:
+                            # Vérification préalable du solde avant d'analyser ou de sniper
+                            current_sol_balance = await check_wallet_balance(wallet)
+                            if current_sol_balance < BUY_AMOUNT_SOL:
+                                # Le solde est insuffisant : on ignore le sniping pour se concentrer uniquement sur les ventes des positions en cours
+                                continue
+
                             for log_entry in logs:
                                 if "Program data: " in log_entry:
                                     try:
@@ -338,7 +350,8 @@ async def listen_pumpfun_mints():
                                                 if success:
                                                     asyncio.create_task(monitor_position(mint_address, symbol, wallet))
                                             else:
-                                                logging.info(f"🛑 Token ignoré ({symbol}) : {reason}")
+                                                # On n'affiche les skips que si on a les fonds pour sniper pour éviter de polluer les logs
+                                                pass
                                     except Exception:
                                         pass
 
@@ -351,7 +364,7 @@ async def listen_pumpfun_mints():
 # ==========================================
 
 async def handle_health_check(request):
-    return web.Response(text="Bot PumpFun Achat Direct Actif 🚀")
+    return web.Response(text="Bot PumpFun Gestion Solde Actif 🚀")
 
 async def start_web_server():
     app = web.Application()
@@ -365,7 +378,7 @@ async def start_web_server():
     logging.info(f"🌐 Mini-serveur HTTP actif sur le port {port}")
 
 async def main():
-    logging.info("🚀 Bot PumpFun démarré - Mode Achat Direct Instantané")
+    logging.info("🚀 Bot PumpFun démarré - Mode Focus Positions / Pause Sniping si Solde Insuffisant")
     await asyncio.gather(
         start_web_server(),
         listen_pumpfun_mints()
