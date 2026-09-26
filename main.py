@@ -37,7 +37,7 @@ BUY_AMOUNT_SOL = float(os.getenv("BUY_AMOUNT_SOL", "0.02"))
 REQUIRE_SOCIALS = os.getenv("REQUIRE_SOCIALS", "False").lower() == "true"
 MAX_DEV_BUY_USD = float(os.getenv("MAX_DEV_BUY_USD", "50.0"))  
 
-# Gestion des Stops & PnL (Sécurité maximale + Scalping agressif)
+# Gestion des Stops & PnL
 INITIAL_STOP_LOSS_PCT = -10.0  
 BASE_TRAILING_PCT = 10.0       
 WIDE_TRAILING_PCT = 20.0       
@@ -52,10 +52,12 @@ BANNED_NAMES = [
 ]
 
 PUMPFUN_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
-SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
+
+# UTILISATION STRICTE DU RPC HELIUS CONFIGURÉ
+SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://mainnet.helius-rpc.com/?api-key=7d50ec7c-921b-4281-8eb7-4d1b1e5f61a2")
 solana_client = AsyncClient(SOLANA_RPC_URL)
 
-# Sémaphore pour éviter de saturer le RPC (Rate Limit 429)
+# Sémaphore pour éviter les 429
 trade_semaphore = asyncio.Semaphore(2)
 
 # ==========================================
@@ -84,16 +86,18 @@ def load_wallet() -> Keypair:
         except Exception:
             return Keypair.from_base58_string(pk_env)
 
-async def check_wallet_balance(wallet: Keypair):
+async def check_wallet_balance(wallet: Keypair) -> float:
     try:
         balance_resp = await solana_client.get_balance(wallet.pubkey())
         lamports = balance_resp.value if hasattr(balance_resp, "value") else balance_resp.get("result", {}).get("value", 0)
         sol_balance = lamports / 1e9
         logging.info(f"💰 Solde du Wallet ({wallet.pubkey()}) : {sol_balance:.4f} SOL")
-        if sol_balance < 0.05:
-            logging.warning("⚠️ ATTENTION : Votre solde SOL est très faible ! Risque d'échec des transactions.")
+        if sol_balance < 0.02:
+            logging.warning("⚠️ ATTENTION : Solde insuffisant (< 0.02 SOL). Les transactions vont échouer !")
+        return sol_balance
     except Exception as e:
         logging.error(f"❌ Impossible de récupérer le solde du wallet : {e}")
+        return 0.0
 
 # ==========================================
 # PARSEUR DES LOGS PUMPFUN
@@ -130,7 +134,7 @@ def parse_pumpfun_event(program_data_hex):
         return None
 
 # ==========================================
-# FILTRES DE SÉCURITÉ AVANCÉS
+# FILTRES DE SÉCURITÉ
 # ==========================================
 
 def validate_token_filters(token_data: dict) -> tuple[bool, str]:
@@ -160,6 +164,12 @@ def validate_token_filters(token_data: dict) -> tuple[bool, str]:
 async def execute_trade(mint_str: str, wallet: Keypair, action: str, amount_val=None) -> bool:
     async with trade_semaphore:
         try:
+            # Vérification rapide du solde avant d'envoyer l'ordre
+            current_balance = await check_wallet_balance(wallet)
+            if current_balance < 0.01 and action == "buy":
+                logging.error("❌ Achat annulé : Solde de SOL insuffisant.")
+                return False
+
             clean_mint = mint_str.strip().replace("\n", "").replace("\r", "")
             clean_pubkey = str(wallet.pubkey()).strip().replace("\n", "").replace("\r", "")
             
@@ -185,10 +195,18 @@ async def execute_trade(mint_str: str, wallet: Keypair, action: str, amount_val=
                     raw_data = await resp.read()
 
             tx = VersionedTransaction.from_bytes(raw_data)
-            signed_tx = VersionedTransaction(tx.message, [wallet])
-            tx_sig = await solana_client.send_raw_transaction(bytes(signed_tx))
             
+            # Récupération d'un blockhash frais directement via le client Helius pour éviter les erreurs d'expiration
+            recent_blockhash_resp = await solana_client.get_latest_blockhash()
+            blockhash = recent_blockhash_resp.value.blockhash
+            
+            # Reconstruction de la transaction avec le blockhash actuel frais
+            message = tx.message
+            signed_tx = VersionedTransaction(message, [wallet])
+            
+            tx_sig = await solana_client.send_raw_transaction(bytes(signed_tx))
             sig_str = tx_sig.get("result") if isinstance(tx_sig, dict) else getattr(tx_sig, "value", tx_sig)
+            
             logging.info(f"🎯 [{action.upper()}] Succès ! https://solscan.io/tx/{sig_str}")
             return True
 
@@ -225,7 +243,6 @@ async def monitor_position(mint: str, symbol: str, wallet: Keypair):
 
     while True:
         await asyncio.sleep(1.0) 
-        
         current_price = await fetch_token_price(clean_mint)
         elapsed_time = time.time() - start_time
         
@@ -263,7 +280,7 @@ async def listen_pumpfun_mints():
     wallet = load_wallet()
     await check_wallet_balance(wallet)
     
-    uri = os.getenv("SOLANA_WSS_URI", "wss://mainnet.helius-rpc.com/?api-key=TON_API_KEY")
+    uri = os.getenv("SOLANA_WSS_URI", "wss://mainnet.helius-rpc.com/?api-key=7d50ec7c-921b-4281-8eb7-4d1b1e5f61a2")
     
     while True:
         try:
@@ -275,7 +292,7 @@ async def listen_pumpfun_mints():
                     "params": [{"mentions": [PUMPFUN_PROGRAM_ID]}, {"commitment": "processed"}]
                 }
                 await websocket.send(json.dumps(sub_payload))
-                logging.info("🔗 Connecté au WebSocket Solana - Mode Sécurité & Rentabilité Actif...")
+                logging.info("🔗 Connecté au WebSocket Solana - Mode Sécurité & Blockhash Dynamique Actif...")
 
                 while True:
                     response = await websocket.recv()
