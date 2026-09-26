@@ -164,7 +164,6 @@ def validate_token_filters(token_data: dict) -> tuple[bool, str]:
 async def execute_trade(mint_str: str, wallet: Keypair, action: str, amount_val=None) -> bool:
     async with trade_semaphore:
         try:
-            # Vérification rapide du solde avant d'envoyer l'ordre
             current_balance = await check_wallet_balance(wallet)
             if current_balance < 0.01 and action == "buy":
                 logging.error("❌ Achat annulé : Solde de SOL insuffisant.")
@@ -181,8 +180,8 @@ async def execute_trade(mint_str: str, wallet: Keypair, action: str, amount_val=
                 "mint": clean_mint,
                 "denominatedInSol": "true" if action == "buy" else "false",
                 "amount": amount_val if action == "buy" else "100%",
-                "slippage": 15,        
-                "priorityFee": 0.0006, 
+                "slippage": 20,        # Augmentation légère du slippage pour éviter les échecs de prix
+                "priorityFee": 0.001,  # Frais prioritaires augmentés pour passer devant les autres bots
                 "pool": "pump"
             }
 
@@ -196,15 +195,21 @@ async def execute_trade(mint_str: str, wallet: Keypair, action: str, amount_val=
 
             tx = VersionedTransaction.from_bytes(raw_data)
             
-            # Récupération d'un blockhash frais directement via le client Helius pour éviter les erreurs d'expiration
+            # Récupération ultra-fraîche du blockhash pour contrer le "Blockhash not found"
             recent_blockhash_resp = await solana_client.get_latest_blockhash()
             blockhash = recent_blockhash_resp.value.blockhash
             
-            # Reconstruction de la transaction avec le blockhash actuel frais
+            # Réassignation propre du blockhash frais dans le message de la transaction versionnée
             message = tx.message
+            message.recent_blockhash = blockhash
+            
             signed_tx = VersionedTransaction(message, [wallet])
             
-            tx_sig = await solana_client.send_raw_transaction(bytes(signed_tx))
+            # Envoi avec skip_preflight à True pour éviter les faux négatifs de simulation sur Helius
+            tx_sig = await solana_client.send_raw_transaction(
+                bytes(signed_tx), 
+                opts={"skip_preflight": True, "max_retries": 3}
+            )
             sig_str = tx_sig.get("result") if isinstance(tx_sig, dict) else getattr(tx_sig, "value", tx_sig)
             
             logging.info(f"🎯 [{action.upper()}] Succès ! https://solscan.io/tx/{sig_str}")
