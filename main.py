@@ -55,6 +55,9 @@ PUMPFUN_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
 solana_client = AsyncClient(SOLANA_RPC_URL)
 
+# Sémaphore pour éviter de saturer le RPC (Rate Limit 429)
+trade_semaphore = asyncio.Semaphore(2)
+
 # ==========================================
 # CHARGEMENT DU WALLET
 # ==========================================
@@ -80,6 +83,17 @@ def load_wallet() -> Keypair:
                 return Keypair.from_base58_string(pk_env)
         except Exception:
             return Keypair.from_base58_string(pk_env)
+
+async def check_wallet_balance(wallet: Keypair):
+    try:
+        balance_resp = await solana_client.get_balance(wallet.pubkey())
+        lamports = balance_resp.value if hasattr(balance_resp, "value") else balance_resp.get("result", {}).get("value", 0)
+        sol_balance = lamports / 1e9
+        logging.info(f"💰 Solde du Wallet ({wallet.pubkey()}) : {sol_balance:.4f} SOL")
+        if sol_balance < 0.05:
+            logging.warning("⚠️ ATTENTION : Votre solde SOL est très faible ! Risque d'échec des transactions.")
+    except Exception as e:
+        logging.error(f"❌ Impossible de récupérer le solde du wallet : {e}")
 
 # ==========================================
 # PARSEUR DES LOGS PUMPFUN
@@ -144,42 +158,43 @@ def validate_token_filters(token_data: dict) -> tuple[bool, str]:
 # ==========================================
 
 async def execute_trade(mint_str: str, wallet: Keypair, action: str, amount_val=None) -> bool:
-    try:
-        clean_mint = mint_str.strip().replace("\n", "").replace("\r", "")
-        clean_pubkey = str(wallet.pubkey()).strip().replace("\n", "").replace("\r", "")
-        
-        url = "https://pumpportal.fun/api/trade-local"
-        
-        payload = {
-            "publicKey": clean_pubkey,
-            "action": action,
-            "mint": clean_mint,
-            "denominatedInSol": "true" if action == "buy" else "false",
-            "amount": amount_val if action == "buy" else "100%",
-            "slippage": 15,        
-            "priorityFee": 0.0006, 
-            "pool": "pump"
-        }
+    async with trade_semaphore:
+        try:
+            clean_mint = mint_str.strip().replace("\n", "").replace("\r", "")
+            clean_pubkey = str(wallet.pubkey()).strip().replace("\n", "").replace("\r", "")
+            
+            url = "https://pumpportal.fun/api/trade-local"
+            
+            payload = {
+                "publicKey": clean_pubkey,
+                "action": action,
+                "mint": clean_mint,
+                "denominatedInSol": "true" if action == "buy" else "false",
+                "amount": amount_val if action == "buy" else "100%",
+                "slippage": 15,        
+                "priorityFee": 0.0006, 
+                "pool": "pump"
+            }
 
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload) as resp:
-                if resp.status != 200:
-                    error_text = await resp.text()
-                    logging.error(f"❌ Erreur API PumpPortal ({action.upper()}) : {error_text}")
-                    return False
-                raw_data = await resp.read()
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=payload) as resp:
+                    if resp.status != 200:
+                        error_text = await resp.text()
+                        logging.error(f"❌ Erreur API PumpPortal ({action.upper()}) : {error_text}")
+                        return False
+                    raw_data = await resp.read()
 
-        tx = VersionedTransaction.from_bytes(raw_data)
-        signed_tx = VersionedTransaction(tx.message, [wallet])
-        tx_sig = await solana_client.send_raw_transaction(bytes(signed_tx))
-        
-        sig_str = tx_sig.get("result") if isinstance(tx_sig, dict) else getattr(tx_sig, "value", tx_sig)
-        logging.info(f"🎯 [{action.upper()}] Succès ! https://solscan.io/tx/{sig_str}")
-        return True
+            tx = VersionedTransaction.from_bytes(raw_data)
+            signed_tx = VersionedTransaction(tx.message, [wallet])
+            tx_sig = await solana_client.send_raw_transaction(bytes(signed_tx))
+            
+            sig_str = tx_sig.get("result") if isinstance(tx_sig, dict) else getattr(tx_sig, "value", tx_sig)
+            logging.info(f"🎯 [{action.upper()}] Succès ! https://solscan.io/tx/{sig_str}")
+            return True
 
-    except Exception as e:
-        logging.error(f"❌ Exception lors de l'ordre {action} sur {mint_str}: {e}")
-        return False
+        except Exception as e:
+            logging.error(f"❌ Exception lors de l'ordre {action} sur {mint_str}: {e}")
+            return False
 
 async def fetch_token_price(mint: str) -> float:
     try:
@@ -246,6 +261,8 @@ async def monitor_position(mint: str, symbol: str, wallet: Keypair):
 
 async def listen_pumpfun_mints():
     wallet = load_wallet()
+    await check_wallet_balance(wallet)
+    
     uri = os.getenv("SOLANA_WSS_URI", "wss://mainnet.helius-rpc.com/?api-key=TON_API_KEY")
     
     while True:
