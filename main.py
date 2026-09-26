@@ -32,8 +32,8 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S"
 )
 
-# Paramètres de Trading & Optimisation Marché
-BUY_AMOUNT_SOL = float(os.getenv("BUY_AMOUNT_SOL", "0.02"))  
+# Paramètres de Trading : Montant fixé à 0.02 SOL
+BUY_AMOUNT_SOL = 0.02  
 
 # Filtres de Marché Avancés (Liquidité & MarketCap en USD)
 MIN_MARKET_CAP_USD = float(os.getenv("MIN_MARKET_CAP_USD", "1000.0"))  
@@ -94,8 +94,8 @@ async def check_wallet_balance(wallet: Keypair) -> float:
         lamports = balance_resp.value if hasattr(balance_resp, "value") else balance_resp.get("result", {}).get("value", 0)
         sol_balance = lamports / 1e9
         logging.info(f"💰 Solde du Wallet ({wallet.pubkey()}) : {sol_balance:.4f} SOL")
-        if sol_balance < 0.02:
-            logging.warning("⚠️ ATTENTION : Solde insuffisant (< 0.02 SOL). Rechargez votre wallet !")
+        if sol_balance < BUY_AMOUNT_SOL:
+            logging.warning(f"⚠️ ATTENTION : Solde insuffisant (< {BUY_AMOUNT_SOL} SOL). Rechargez votre wallet !")
         return sol_balance
     except Exception as e:
         logging.error(f"❌ Impossible de récupérer le solde du wallet : {e}")
@@ -136,19 +136,25 @@ def parse_pumpfun_event(program_data_hex):
         return None
 
 # ==========================================
-# RÉCUPÉRATION DES MÉTRIQUES DE MARCHÉ & SOCIAUX
+# RÉCUPÉRATION DES MÉTRIQUES DE MARCHÉ (AVEC RETRY)
 # ==========================================
 
 async def fetch_token_market_data(mint: str) -> dict:
-    try:
-        clean_mint = mint.strip().replace("\n", "").replace("\r", "")
-        url = f"https://pumpportal.fun/api/data/token/{clean_mint}"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=3) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-    except Exception:
-        pass
+    clean_mint = mint.strip().replace("\n", "").replace("\r", "")
+    url = f"https://pumpportal.fun/api/data/token/{clean_mint}"
+    
+    for attempt in range(3):
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=3) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if data and isinstance(data, dict) and len(data) > 0:
+                            return data
+        except Exception:
+            pass
+        await asyncio.sleep(0.8)
+        
     return {}
 
 # ==========================================
@@ -164,16 +170,16 @@ async def validate_token_filters(token_data: dict) -> tuple[bool, str]:
     if mint in processed_tokens:
         return False, "Token déjà traité ou acheté (Anti-Doublon)"
 
-    # 2. RÈGLE BLACKLIST / MOTS SUSPECTS (Pas de filtre de longueur de nom ici)
+    # 2. RÈGLE BLACKLIST / MOTS SUSPECTS
     upper_symbol = symbol.upper()
     upper_name = name.upper()
     if upper_symbol in BANNED_NAMES or any(banned in upper_name for banned in BANNED_NAMES if len(banned) > 2):
         return False, f"Nom/Symbole suspect ('{symbol}')"
 
-    # 3. RÉCUPÉRATION DES DONNÉES DE MARCHÉ & RÉSEAUX VIA API
+    # 3. RÉCUPÉRATION DES DONNÉES DE MARCHÉ & RÉSEAUX VIA API (Avec Retry)
     market_data = await fetch_token_market_data(mint)
     if not market_data:
-        return False, "Impossible de récupérer les métriques du token (API injoignable)"
+        return False, "Impossible de récupérer les métriques du token (API non indexée après retries)"
 
     # Vérification des réseaux sociaux (Sécurité Anti-Rug)
     twitter = market_data.get("twitter")
@@ -204,8 +210,8 @@ async def execute_trade(mint_str: str, wallet: Keypair, action: str, amount_val=
     async with trade_semaphore:
         try:
             current_balance = await check_wallet_balance(wallet)
-            if current_balance < 0.01 and action == "buy":
-                logging.error("❌ Achat annulé : Solde de SOL insuffisant.")
+            if current_balance < BUY_AMOUNT_SOL and action == "buy":
+                logging.error(f"❌ Achat annulé : Solde de SOL insuffisant (< {BUY_AMOUNT_SOL} SOL).")
                 return False
 
             clean_mint = mint_str.strip().replace("\n", "").replace("\r", "")
@@ -329,7 +335,7 @@ async def listen_pumpfun_mints():
                     "params": [{"mentions": [PUMPFUN_PROGRAM_ID]}, {"commitment": "processed"}]
                 }
                 await websocket.send(json.dumps(sub_payload))
-                logging.info("🔗 Connecté au WebSocket Solana - Filtres MarketCap & Sécurité Actifs...")
+                logging.info("🔗 Connecté au WebSocket Solana - Achat à 0.02 SOL & Filtres Actifs...")
 
                 while True:
                     response = await websocket.recv()
@@ -372,7 +378,7 @@ async def listen_pumpfun_mints():
 # ==========================================
 
 async def handle_health_check(request):
-    return web.Response(text="Bot PumpFun Optimisé (MarketCap/Volume) Actif 🚀")
+    return web.Response(text="Bot PumpFun (0.02 SOL) Actif 🚀")
 
 async def start_web_server():
     app = web.Application()
@@ -386,7 +392,7 @@ async def start_web_server():
     logging.info(f"🌐 Mini-serveur HTTP actif sur le port {port}")
 
 async def main():
-    logging.info("🚀 Bot PumpFun démarré - Mode Rentabilité & Sécurité")
+    logging.info("🚀 Bot PumpFun démarré - Mode Achat 0.02 SOL & Sécurité")
     await asyncio.gather(
         start_web_server(),
         listen_pumpfun_mints()
