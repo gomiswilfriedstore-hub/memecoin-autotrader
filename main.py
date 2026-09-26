@@ -9,11 +9,13 @@ import aiohttp
 import websockets
 import base58
 
-from aiohttp import web
-from solana.rpc.async_api import AsyncClient
-from solders.keypair import Keypair
-from solders.pubkey import Pubkey
-from solders.transaction import VersionedTransaction
+# ==========================================
+# NETTOYAGE GLOBAL DES VARIABLES D'ENVIRONNEMENT
+# (Éradique les \n cachés dans les configs Render)
+# ==========================================
+for env_key, env_val in list(os.environ.items()):
+    if isinstance(env_val, str):
+        os.environ[env_key] = env_val.strip().replace("\n", "").replace("\r", "")
 
 # ==========================================
 # CONFIGURATION DES LOGS & ENVIRONNEMENT
@@ -57,9 +59,6 @@ def load_wallet() -> Keypair:
     if not pk_env:
         raise ValueError("❌ Aucune clé privée 'SOLANA_PRIVATE_KEY' trouvée dans l'environnement !")
     
-    # Nettoyage de la clé privée contre les espaces ou retours à la ligne cachés
-    pk_env = pk_env.strip().replace("\n", "").replace("\r", "")
-
     if pk_env.startswith("["):
         secret_key = json.loads(pk_env)
         if len(secret_key) == 32:
@@ -141,7 +140,6 @@ def validate_token_filters(token_data: dict) -> tuple[bool, str]:
 
 async def execute_trade(mint_str: str, wallet: Keypair, action: str, amount_val=None) -> bool:
     try:
-        # Nettoyage rigoureux anti-caractères invisibles et \n
         clean_mint = mint_str.strip().replace("\n", "").replace("\r", "")
         clean_pubkey = str(wallet.pubkey()).strip().replace("\n", "").replace("\r", "")
         
