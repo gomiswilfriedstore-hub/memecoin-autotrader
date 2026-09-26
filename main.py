@@ -141,7 +141,7 @@ async def execute_buy_order(mint_str: str, wallet: Keypair) -> bool:
         payload = {
             "publicKey": str(wallet.pubkey()),
             "action": "buy",
-            "mint": mint_str,
+            "mint": mint_str.strip(),  # Nettoyage des espaces/retours à la ligne
             "denominatedInSol": "true",
             "amount": BUY_AMOUNT_SOL,
             "slippage": 15,
@@ -151,15 +151,21 @@ async def execute_buy_order(mint_str: str, wallet: Keypair) -> bool:
 
         async with aiohttp.ClientSession() as session:
             async with session.post(url, json=payload) as resp:
+                response_text = await resp.text()
                 if resp.status != 200:
-                    logging.error(f"❌ Erreur API PumpPortal: {await resp.text()}")
+                    logging.error(f"❌ Erreur API PumpPortal: {response_text}")
                     return False
-                tx_bytes = await resp.read()
+                
+                # Nettoyage et décodage robuste de la réponse
+                tx_bytes = response_text.strip().encode('utf-8')
+                try:
+                    raw_data = base64.b64decode(tx_bytes)
+                except Exception:
+                    raw_data = await resp.read()
 
-        tx = VersionedTransaction.from_bytes(tx_bytes)
+        tx = VersionedTransaction.from_bytes(raw_data)
         signed_tx = VersionedTransaction(tx.message, [wallet])
 
-        # Envoi direct de la transaction brute (Correction de l'erreur preflight_commitment)
         tx_sig = await solana_client.send_raw_transaction(bytes(signed_tx))
         
         sig_str = tx_sig.get("result") if isinstance(tx_sig, dict) else getattr(tx_sig, "value", tx_sig)
