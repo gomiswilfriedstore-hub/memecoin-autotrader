@@ -11,7 +11,6 @@ import base58
 
 from aiohttp import web
 from solana.rpc.async_api import AsyncClient
-from solana.rpc.types import TxOpts
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
 from solders.transaction import VersionedTransaction
@@ -106,7 +105,6 @@ def parse_pumpfun_event(program_data_hex):
         
         return event_data
     except Exception:
-        # Silencieux pour éviter de polluer les logs sur des instructions de programme non-concernées
         return None
 
 # ==========================================
@@ -161,10 +159,10 @@ async def execute_buy_order(mint_str: str, wallet: Keypair) -> bool:
         tx = VersionedTransaction.from_bytes(tx_bytes)
         signed_tx = VersionedTransaction(tx.message, [wallet])
 
-        # Utilisation sécurisée de TxOpts pour éviter le bug de dictionnaire
+        # Envoi de la transaction avec options directes (contourne l'erreur TxOpts)
         tx_sig = await solana_client.send_raw_transaction(
             bytes(signed_tx),
-            opts=TxOpts(skip_preflight=True, max_retries=2)
+            opts={"skip_preflight": True, "max_retries": 2}
         )
         
         sig_str = tx_sig.get("result") if isinstance(tx_sig, dict) else getattr(tx_sig, "value", tx_sig)
