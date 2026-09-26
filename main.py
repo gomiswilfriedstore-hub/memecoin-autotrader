@@ -9,6 +9,8 @@ import aiohttp
 import websockets
 import base58
 
+from solana.rpc.async_api import AsyncClient
+
 # ==========================================
 # NETTOYAGE GLOBAL DES VARIABLES D'ENVIRONNEMENT
 # (Éradique les \n cachés dans les configs Render)
