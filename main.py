@@ -193,16 +193,29 @@ async def execute_trade(mint_str: str, wallet: Keypair, action: str, amount_val=
                         return False
                     raw_data = await resp.read()
 
-            # Désérialisation et signature directe de la transaction fournie par PumpPortal
+            # Signature de la transaction
             tx = VersionedTransaction.from_bytes(raw_data)
             signed_tx = VersionedTransaction(tx.message, [wallet])
             
-            tx_sig = await solana_client.send_raw_transaction(
-                bytes(signed_tx), 
-                opts={"skip_preflight": True, "max_retries": 3}
-            )
-            sig_str = tx_sig.get("result") if isinstance(tx_sig, dict) else getattr(tx_sig, "value", tx_sig)
-            
+            # Envoi direct via JSON-RPC pour éviter les erreurs de typage avec le client SDK
+            rpc_payload = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "sendTransaction",
+                "params": [
+                    base64.b64encode(bytes(signed_tx)).decode('utf-8'),
+                    {"encoding": "base64", "skipPreflight": True, "maxRetries": 3}
+                ]
+            }
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(SOLANA_RPC_URL, json=rpc_payload) as resp:
+                    res_json = await resp.json()
+                    if "error" in res_json:
+                        logging.error(f"❌ Erreur RPC Solana : {res_json['error']}")
+                        return False
+                    sig_str = res_json.get("result")
+
             logging.info(f"🎯 [{action.upper()}] Succès ! https://solscan.io/tx/{sig_str}")
             return True
 
