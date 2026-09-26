@@ -11,6 +11,7 @@ import base58
 
 from aiohttp import web
 from solana.rpc.async_api import AsyncClient
+from solana.rpc.types import TxOpts
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
 from solders.transaction import VersionedTransaction
@@ -104,8 +105,8 @@ def parse_pumpfun_event(program_data_hex):
         event_data['user'], offset = read_pubkey(data_bytes, offset)
         
         return event_data
-    except Exception as e:
-        logging.error(f"Erreur de décodage du log PumpFun : {e}")
+    except Exception:
+        # Silencieux pour éviter de polluer les logs sur des instructions de programme non-concernées
         return None
 
 # ==========================================
@@ -160,12 +161,15 @@ async def execute_buy_order(mint_str: str, wallet: Keypair) -> bool:
         tx = VersionedTransaction.from_bytes(tx_bytes)
         signed_tx = VersionedTransaction(tx.message, [wallet])
 
+        # Utilisation sécurisée de TxOpts pour éviter le bug de dictionnaire
         tx_sig = await solana_client.send_raw_transaction(
             bytes(signed_tx),
-            opts={"skip_preflight": True, "max_retries": 2}
+            opts=TxOpts(skip_preflight=True, max_retries=2)
         )
         
-        logging.info(f"🚀 [ACHAT] Tx envoyée! https://solscan.io/tx/{str(tx_sig.value)}")
+        sig_str = tx_sig.get("result") if isinstance(tx_sig, dict) else getattr(tx_sig, "value", tx_sig)
+        
+        logging.info(f"🚀 [ACHAT] Tx envoyée! https://solscan.io/tx/{sig_str}")
         return True
 
     except Exception as e:
@@ -238,7 +242,6 @@ async def listen_pumpfun_mints():
                         logs = data["params"]["result"]["value"]["logs"]
                         logs_str = "".join(logs)
                         
-                        # Détection d'un nouveau mint sur PumpFun
                         if "Instruction: InitializeMint" in logs_str or "Instruction: Create" in logs_str:
                             for log_entry in logs:
                                 if "Program data: " in log_entry:
@@ -247,12 +250,11 @@ async def listen_pumpfun_mints():
                                         hex_data = base64.b64decode(base64_data).hex()
                                         token_info = parse_pumpfun_event(hex_data)
                                         
-                                        if token_info:
+                                        if token_info and 'mint' in token_info:
                                             mint_address = token_info['mint']
                                             symbol = token_info['symbol']
                                             name = token_info['name']
                                             
-                                            # On applique les filtres de sécurité sur le vrai token
                                             is_valid, reason = validate_token_filters(token_info)
                                             if is_valid:
                                                 logging.info(f"🚀 VRAI TOKEN VALIDE ! Nom: {name} ({symbol}) | Mint: {mint_address}")
