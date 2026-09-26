@@ -35,11 +35,6 @@ logging.basicConfig(
 # Paramètres de Trading : Montant fixé à 0.02 SOL
 BUY_AMOUNT_SOL = 0.02  
 
-# Filtres de Marché Avancés (Liquidité & MarketCap en USD)
-MIN_MARKET_CAP_USD = float(os.getenv("MIN_MARKET_CAP_USD", "1000.0"))  
-MAX_MARKET_CAP_USD = float(os.getenv("MAX_MARKET_CAP_USD", "45000.0")) 
-MIN_VOLUME_USD = float(os.getenv("MIN_VOLUME_USD", "200.0"))           
-
 # Gestion des Stops & PnL
 INITIAL_STOP_LOSS_PCT = -10.0  
 BASE_TRAILING_PCT = 10.0       
@@ -136,7 +131,7 @@ def parse_pumpfun_event(program_data_hex):
         return None
 
 # ==========================================
-# RÉCUPÉRATION DES MÉTRIQUES DE MARCHÉ (AVEC RETRY)
+# RÉCUPÉRATION DES MÉTRIQUES DE MARCHÉ (POUR LE SUIVI)
 # ==========================================
 
 async def fetch_token_market_data(mint: str) -> dict:
@@ -158,49 +153,24 @@ async def fetch_token_market_data(mint: str) -> dict:
     return {}
 
 # ==========================================
-# FILTRES DE SÉCURITÉ, MARCHÉ & ANTI-DOUBLONS
+# FILTRE RAPIDE (ANTI-BLACKLIST UNIQUEMENT)
 # ==========================================
 
-async def validate_token_filters(token_data: dict) -> tuple[bool, str]:
+def validate_token_quick(token_data: dict) -> tuple[bool, str]:
     symbol = token_data.get("symbol", "").strip()
     name = token_data.get("name", "").strip()
     mint = token_data.get("mint", "").strip()
 
-    # 1. RÈGLE ANTI-DOUBLON
     if mint in processed_tokens:
-        return False, "Token déjà traité ou acheté (Anti-Doublon)"
+        return False, "Token déjà traité"
 
-    # 2. RÈGLE BLACKLIST / MOTS SUSPECTS
     upper_symbol = symbol.upper()
     upper_name = name.upper()
     if upper_symbol in BANNED_NAMES or any(banned in upper_name for banned in BANNED_NAMES if len(banned) > 2):
         return False, f"Nom/Symbole suspect ('{symbol}')"
 
-    # 3. RÉCUPÉRATION DES DONNÉES DE MARCHÉ & RÉSEAUX VIA API (Avec Retry)
-    market_data = await fetch_token_market_data(mint)
-    if not market_data:
-        return False, "Impossible de récupérer les métriques du token (API non indexée après retries)"
-
-    # Vérification des réseaux sociaux (Sécurité Anti-Rug)
-    twitter = market_data.get("twitter")
-    telegram = market_data.get("telegram")
-    website = market_data.get("website")
-    if not (twitter or telegram or website):
-        return False, "Aucun réseau social détecté (Potentiel Rug)"
-
-    # 4. FILTRES DE RENTABILITÉ : MARKET CAP & VOLUME
-    market_cap = float(market_data.get("marketCap", market_data.get("usd_market_cap", 0)) or 0)
-    volume = float(market_data.get("v_usd", market_data.get("volume", 0)) or 0)
-
-    if market_cap > 0:
-        if market_cap < MIN_MARKET_CAP_USD:
-            return False, f"Market Cap trop faible ({market_cap}$ < {MIN_MARKET_CAP_USD}$)"
-        if market_cap > MAX_MARKET_CAP_USD:
-            return False, f"Market Cap trop élevée ({market_cap}$ > {MAX_MARKET_CAP_USD}$)"
-
-    # Marquer comme traité pour l'anti-doublon
     processed_tokens.add(mint)
-    return True, f"Validé (MCap: {market_cap}$, Vol: {volume}$)"
+    return True, "Nom valide"
 
 # ==========================================
 # EXÉCUTION DES TRADES (ACHAT / VENTE)
@@ -272,6 +242,9 @@ async def fetch_token_price(mint: str) -> float:
 
 async def monitor_position(mint: str, symbol: str, wallet: Keypair):
     clean_mint = mint.strip().replace("\n", "").replace("\r", "")
+    
+    # Petite pause pour laisser le temps à l'API de référencer le prix d'entrée
+    await asyncio.sleep(2.0)
     entry_price = await fetch_token_price(clean_mint)
     if entry_price <= 0:
         entry_price = 1.0
@@ -335,7 +308,7 @@ async def listen_pumpfun_mints():
                     "params": [{"mentions": [PUMPFUN_PROGRAM_ID]}, {"commitment": "processed"}]
                 }
                 await websocket.send(json.dumps(sub_payload))
-                logging.info("🔗 Connecté au WebSocket Solana - Achat à 0.02 SOL & Filtres Actifs...")
+                logging.info("🔗 Connecté au WebSocket Solana - Achat direct instantané actif...")
 
                 while True:
                     response = await websocket.recv()
@@ -358,9 +331,9 @@ async def listen_pumpfun_mints():
                                             symbol = token_info['symbol'].strip()
                                             name = token_info['name'].strip()
                                             
-                                            is_valid, reason = await validate_token_filters(token_info)
+                                            is_valid, reason = validate_token_quick(token_info)
                                             if is_valid:
-                                                logging.info(f"🚀 TOKEN VALIDÉ ({reason}) ! {name} ({symbol})")
+                                                logging.info(f"🚀 NOUVEAU TOKEN DÉTECTÉ ({name} / {symbol}) - Achat immédiat à {BUY_AMOUNT_SOL} SOL !")
                                                 success = await execute_trade(mint_address, wallet, "buy", BUY_AMOUNT_SOL)
                                                 if success:
                                                     asyncio.create_task(monitor_position(mint_address, symbol, wallet))
@@ -378,7 +351,7 @@ async def listen_pumpfun_mints():
 # ==========================================
 
 async def handle_health_check(request):
-    return web.Response(text="Bot PumpFun (0.02 SOL) Actif 🚀")
+    return web.Response(text="Bot PumpFun Achat Direct Actif 🚀")
 
 async def start_web_server():
     app = web.Application()
@@ -392,7 +365,7 @@ async def start_web_server():
     logging.info(f"🌐 Mini-serveur HTTP actif sur le port {port}")
 
 async def main():
-    logging.info("🚀 Bot PumpFun démarré - Mode Achat 0.02 SOL & Sécurité")
+    logging.info("🚀 Bot PumpFun démarré - Mode Achat Direct Instantané")
     await asyncio.gather(
         start_web_server(),
         listen_pumpfun_mints()
