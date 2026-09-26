@@ -159,11 +159,8 @@ async def execute_buy_order(mint_str: str, wallet: Keypair) -> bool:
         tx = VersionedTransaction.from_bytes(tx_bytes)
         signed_tx = VersionedTransaction(tx.message, [wallet])
 
-        # Envoi de la transaction avec options directes (contourne l'erreur TxOpts)
-        tx_sig = await solana_client.send_raw_transaction(
-            bytes(signed_tx),
-            opts={"skip_preflight": True, "max_retries": 2}
-        )
+        # Envoi direct de la transaction brute (Correction de l'erreur preflight_commitment)
+        tx_sig = await solana_client.send_raw_transaction(bytes(signed_tx))
         
         sig_str = tx_sig.get("result") if isinstance(tx_sig, dict) else getattr(tx_sig, "value", tx_sig)
         
