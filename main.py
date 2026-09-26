@@ -26,22 +26,22 @@ logging.basicConfig(
 )
 
 # Paramètres de Trading & Optimisation Marché
-BUY_AMOUNT_SOL = float(os.getenv("BUY_AMOUNT_SOL", "0.02"))  # Montant équilibré pour absorber les frais
+BUY_AMOUNT_SOL = float(os.getenv("BUY_AMOUNT_SOL", "0.02"))  
 REQUIRE_SOCIALS = os.getenv("REQUIRE_SOCIALS", "False").lower() == "true"
-MAX_DEV_BUY_USD = float(os.getenv("MAX_DEV_BUY_USD", "50.0"))  # Filtre anti-whale/dev strict
+MAX_DEV_BUY_USD = float(os.getenv("MAX_DEV_BUY_USD", "50.0"))  
 
 # Gestion des Stops & PnL (Sécurité maximale + Scalping agressif)
-INITIAL_STOP_LOSS_PCT = -10.0  # Coupe-circuit très rapide (-10%)
-BASE_TRAILING_PCT = 10.0       # Trailing serré pour sécuriser les gains
-WIDE_TRAILING_PCT = 20.0       # Trailing élargi si le token fait plus de 100% (2x)
-BREAKEVEN_TRIGGER_PCT = 25.0   # Sécurisation à l'entrée dès +25%
-MAX_HOLD_TIME_SEC = 90         # Timeout strict
+INITIAL_STOP_LOSS_PCT = -10.0  
+BASE_TRAILING_PCT = 10.0       
+WIDE_TRAILING_PCT = 20.0       
+BREAKEVEN_TRIGGER_PCT = 25.0   
+MAX_HOLD_TIME_SEC = 90         
 
-# Blacklist affinée contre les pièges courants
+# Blacklist affinée
 BANNED_NAMES = [
     "YO", "TEST", "PUMP", "SOL", "UNKNOWN", "NULL", "MOON", 
     "MEME", "COIN", "DOGE", "PEPE", "SHIB", "DEV", "ANON", "INU", "ELON",
-    "ETF", "AI", "AIRDROP", "CLAIM", "SAFE", "BABY", "INU", "CAT"
+    "ETF", "AI", "AIRDROP", "CLAIM", "SAFE", "BABY", "CAT"
 ]
 
 PUMPFUN_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
@@ -57,6 +57,9 @@ def load_wallet() -> Keypair:
     if not pk_env:
         raise ValueError("❌ Aucune clé privée 'SOLANA_PRIVATE_KEY' trouvée dans l'environnement !")
     
+    # Nettoyage de la clé privée contre les espaces ou retours à la ligne cachés
+    pk_env = pk_env.strip().replace("\n", "").replace("\r", "")
+
     if pk_env.startswith("["):
         secret_key = json.loads(pk_env)
         if len(secret_key) == 32:
@@ -83,13 +86,13 @@ def read_length_prefixed_string(data, offset):
     offset += 4
     string_data = data[offset:offset + length]
     offset += length
-    return string_data.decode('utf-8', errors='ignore').strip('\x00').strip(), offset
+    return string_data.decode('utf-8', errors='ignore').strip('\x00').strip().replace("\n", "").replace("\r", ""), offset
 
 def read_pubkey(data, offset):
     pubkey_data = data[offset:offset + 32]
     offset += 32
     pubkey = str(Pubkey.from_bytes(pubkey_data))
-    return pubkey.strip(), offset
+    return pubkey.strip().replace("\n", "").replace("\r", ""), offset
 
 def parse_pumpfun_event(program_data_hex):
     try:
@@ -138,17 +141,20 @@ def validate_token_filters(token_data: dict) -> tuple[bool, str]:
 
 async def execute_trade(mint_str: str, wallet: Keypair, action: str, amount_val=None) -> bool:
     try:
-        clean_mint = mint_str.strip()
+        # Nettoyage rigoureux anti-caractères invisibles et \n
+        clean_mint = mint_str.strip().replace("\n", "").replace("\r", "")
+        clean_pubkey = str(wallet.pubkey()).strip().replace("\n", "").replace("\r", "")
+        
         url = "https://pumpportal.fun/api/trade-local"
         
         payload = {
-            "publicKey": str(wallet.pubkey()),
+            "publicKey": clean_pubkey,
             "action": action,
             "mint": clean_mint,
             "denominatedInSol": "true" if action == "buy" else "false",
             "amount": amount_val if action == "buy" else "100%",
-            "slippage": 15,        # Slippage maîtrisé pour limiter le front-running
-            "priorityFee": 0.0006, # Frais de priorité optimisés pour la vitesse
+            "slippage": 15,        
+            "priorityFee": 0.0006, 
             "pool": "pump"
         }
 
@@ -174,7 +180,7 @@ async def execute_trade(mint_str: str, wallet: Keypair, action: str, amount_val=
 
 async def fetch_token_price(mint: str) -> float:
     try:
-        clean_mint = mint.strip()
+        clean_mint = mint.strip().replace("\n", "").replace("\r", "")
         url = f"https://pumpportal.fun/api/data/token/{clean_mint}"
         async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=2) as resp:
@@ -186,7 +192,7 @@ async def fetch_token_price(mint: str) -> float:
     return 1.0
 
 async def monitor_position(mint: str, symbol: str, wallet: Keypair):
-    clean_mint = mint.strip()
+    clean_mint = mint.strip().replace("\n", "").replace("\r", "")
     entry_price = await fetch_token_price(clean_mint)
     if entry_price <= 0:
         entry_price = 1.0
@@ -200,7 +206,7 @@ async def monitor_position(mint: str, symbol: str, wallet: Keypair):
     logging.info(f"🛡️ [SUIVI] Position active sur {symbol} | Entrée: {entry_price} | SL Initial: {stop_loss_price:.4f}")
 
     while True:
-        await asyncio.sleep(1.0) # Surveillance très rapprochée
+        await asyncio.sleep(1.0) 
         
         current_price = await fetch_token_price(clean_mint)
         elapsed_time = time.time() - start_time
@@ -215,20 +221,17 @@ async def monitor_position(mint: str, symbol: str, wallet: Keypair):
             highest_price = current_price
             peak_pnl_pct = ((highest_price - entry_price) / entry_price) * 100
 
-        # Sécurisation au Breakeven
         if peak_pnl_pct >= BREAKEVEN_TRIGGER_PCT and not breakeven_secured:
             stop_loss_price = entry_price * 1.01  
             breakeven_secured = True
             logging.info(f"🛡️ [BREAKEVEN] {symbol} sécurisé à l'entrée.")
 
-        # Trailing Stop Dynamique
         active_trailing = WIDE_TRAILING_PCT if peak_pnl_pct >= 100.0 else BASE_TRAILING_PCT
         if peak_pnl_pct > 0:
             new_stop = highest_price * (1 - (active_trailing / 100.0))
             if new_stop > stop_loss_price:
                 stop_loss_price = new_stop
 
-        # Déclenchement de la Vente (Stop-Loss, Trailing ou Timeout)
         if current_price <= stop_loss_price or elapsed_time >= MAX_HOLD_TIME_SEC:
             logging.info(f"⚡ [CLÔTURE] {symbol} - PnL: {current_pnl_pct:.2f}% | Temps: {elapsed_time:.1f}s")
             await execute_trade(clean_mint, wallet, "sell")
@@ -271,9 +274,9 @@ async def listen_pumpfun_mints():
                                         token_info = parse_pumpfun_event(hex_data)
                                         
                                         if token_info and 'mint' in token_info:
-                                            mint_address = token_info['mint'].strip()
-                                            symbol = token_info['symbol'].strip()
-                                            name = token_info['name'].strip()
+                                            mint_address = token_info['mint'].strip().replace("\n", "").replace("\r", "")
+                                            symbol = token_info['symbol'].strip().replace("\n", "").replace("\r", "")
+                                            name = token_info['name'].strip().replace("\n", "").replace("\r", "")
                                             
                                             is_valid, reason = validate_token_filters(token_info)
                                             if is_valid:
