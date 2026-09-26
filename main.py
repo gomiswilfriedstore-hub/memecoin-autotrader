@@ -4,6 +4,7 @@ import time
 import asyncio
 import logging
 import base64
+import struct
 import aiohttp
 import websockets
 import base58
@@ -11,6 +12,7 @@ import base58
 from aiohttp import web
 from solana.rpc.async_api import AsyncClient
 from solders.keypair import Keypair
+from solders.pubkey import Pubkey
 from solders.transaction import VersionedTransaction
 
 # ==========================================
@@ -46,7 +48,7 @@ SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.co
 solana_client = AsyncClient(SOLANA_RPC_URL)
 
 # ==========================================
-# CHARGEMENT DU WALLET (CORRIGÉ)
+# CHARGEMENT DU WALLET
 # ==========================================
 
 def load_wallet() -> Keypair:
@@ -54,14 +56,11 @@ def load_wallet() -> Keypair:
     if not pk_env:
         raise ValueError("❌ Aucune clé privée 'SOLANA_PRIVATE_KEY' trouvée dans les variables Render !")
     
-    # Si la clé est un tableau JSON [12, 34, ...]
     if pk_env.startswith("["):
         secret_key = json.loads(pk_env)
         if len(secret_key) == 32:
             return Keypair.from_seed(bytes(secret_key))
         return Keypair.from_bytes(bytes(secret_key))
-    
-    # Si c'est une chaîne Base58 (Phantom / Solflare / format brut)
     else:
         try:
             decoded = base58.b58decode(pk_env)
@@ -73,6 +72,41 @@ def load_wallet() -> Keypair:
                 return Keypair.from_base58_string(pk_env)
         except Exception:
             return Keypair.from_base58_string(pk_env)
+
+# ==========================================
+# PARSEUR DES LOGS PUMPFUN
+# ==========================================
+
+def read_length_prefixed_string(data, offset):
+    length = struct.unpack('<I', data[offset:offset + 4])[0]
+    offset += 4
+    string_data = data[offset:offset + length]
+    offset += length
+    return string_data.decode('utf-8', errors='ignore').strip('\x00'), offset
+
+def read_pubkey(data, offset):
+    pubkey_data = data[offset:offset + 32]
+    offset += 32
+    pubkey = str(Pubkey.from_bytes(pubkey_data))
+    return pubkey, offset
+
+def parse_pumpfun_event(program_data_hex):
+    try:
+        data_bytes = bytes.fromhex(program_data_hex)
+        offset = 8  # Ignore le discriminateur d'événement
+        
+        event_data = {}
+        event_data['name'], offset = read_length_prefixed_string(data_bytes, offset)
+        event_data['symbol'], offset = read_length_prefixed_string(data_bytes, offset)
+        event_data['uri'], offset = read_length_prefixed_string(data_bytes, offset)
+        event_data['mint'], offset = read_pubkey(data_bytes, offset)
+        event_data['bonding_curve'], offset = read_pubkey(data_bytes, offset)
+        event_data['user'], offset = read_pubkey(data_bytes, offset)
+        
+        return event_data
+    except Exception as e:
+        logging.error(f"Erreur de décodage du log PumpFun : {e}")
+        return None
 
 # ==========================================
 # FILTRES DE SÉCURITÉ
@@ -99,7 +133,7 @@ def validate_token_filters(token_data: dict) -> tuple[bool, str]:
     return True, "Filtres validés"
 
 # ==========================================
-# EXÉCUTION DES TRADES (ACHAT & SUIVI)
+# EXÉCUTION DES TRADES & SUIVI DE POSITION
 # ==========================================
 
 async def execute_buy_order(mint_str: str, wallet: Keypair) -> bool:
@@ -139,15 +173,14 @@ async def execute_buy_order(mint_str: str, wallet: Keypair) -> bool:
         return False
 
 async def monitor_position(mint: str, symbol: str):
-    """Gère le Trailing Stop, le Breakeven et le Timeout en arrière-plan"""
-    entry_price = 1.0  # Valeur de référence initiale
+    entry_price = 1.0  
     highest_price = entry_price
     start_time = time.time()
     
     stop_loss_price = entry_price * (1 + (INITIAL_STOP_LOSS_PCT / 100.0))
     breakeven_secured = False
 
-    logging.info(f"🛡️ [SUIVI] Position ouverte sur {symbol} | SL Initial: {stop_loss_price:.4f}")
+    logging.info(f"🛡️ [SUIVI] Position ouverte sur {symbol} ({mint}) | SL Initial: {stop_loss_price:.4f}")
 
     while True:
         await asyncio.sleep(1.2)
@@ -162,26 +195,23 @@ async def monitor_position(mint: str, symbol: str):
             highest_price = current_price
             peak_pnl_pct = ((highest_price - entry_price) / entry_price) * 100
 
-        # Breakeven à +30%
         if peak_pnl_pct >= BREAKEVEN_TRIGGER_PCT and not breakeven_secured:
             stop_loss_price = entry_price * 1.02
             breakeven_secured = True
             logging.info(f"🛡️ [BREAKEVEN] {symbol} sécurisé à l'entrée +2%.")
 
-        # Trailing dynamique
         active_trailing = WIDE_TRAILING_PCT if peak_pnl_pct >= 50.0 else BASE_TRAILING_PCT
         if peak_pnl_pct > 0:
             new_stop = highest_price * (1 - (active_trailing / 100.0))
             if new_stop > stop_loss_price:
                 stop_loss_price = new_stop
 
-        # Conditions de sortie
         if current_price <= stop_loss_price or elapsed_time >= MAX_HOLD_TIME_SEC:
             logging.info(f"🎯 [VENTE] Clôture de la position sur {symbol} (PnL: {current_pnl_pct:.2f}%)")
             break
 
 # ==========================================
-# WEBSOCKET PUMPFUN (ÉCOUTE DES TOKENS)
+# WEBSOCKET PUMPFUN (ÉCOUTE EN DIRECT)
 # ==========================================
 
 async def listen_pumpfun_mints():
@@ -198,7 +228,7 @@ async def listen_pumpfun_mints():
                     "params": [{"mentions": [PUMPFUN_PROGRAM_ID]}, {"commitment": "processed"}]
                 }
                 await websocket.send(json.dumps(sub_payload))
-                logging.info("🔗 Connecté au WebSocket Solana - Écoute des lancements PumpFun...")
+                logging.info("🔗 Connecté au WebSocket Solana - Écoute des vrais lancements PumpFun...")
 
                 while True:
                     response = await websocket.recv()
@@ -206,17 +236,33 @@ async def listen_pumpfun_mints():
                     
                     if "params" in data:
                         logs = data["params"]["result"]["value"]["logs"]
-                        if any("InitializeMint" in log for log in logs):
-                            token_mock_data = {"symbol": "TEST", "name": "Test Token", "dev_buy_usd": 10.0}
-                            
-                            is_valid, reason = validate_token_filters(token_mock_data)
-                            if is_valid:
-                                mint_address = "AdresseRecupereeDuLog..."
-                                success = await execute_buy_order(mint_address, wallet)
-                                if success:
-                                    asyncio.create_task(monitor_position(mint_address, token_mock_data["symbol"]))
-                            else:
-                                logging.info(f"🛑 Token ignoré : {reason}")
+                        logs_str = "".join(logs)
+                        
+                        # Détection d'un nouveau mint sur PumpFun
+                        if "Instruction: InitializeMint" in logs_str or "Instruction: Create" in logs_str:
+                            for log_entry in logs:
+                                if "Program data: " in log_entry:
+                                    try:
+                                        base64_data = log_entry.split("Program data: ")[1]
+                                        hex_data = base64.b64decode(base64_data).hex()
+                                        token_info = parse_pumpfun_event(hex_data)
+                                        
+                                        if token_info:
+                                            mint_address = token_info['mint']
+                                            symbol = token_info['symbol']
+                                            name = token_info['name']
+                                            
+                                            # On applique les filtres de sécurité sur le vrai token
+                                            is_valid, reason = validate_token_filters(token_info)
+                                            if is_valid:
+                                                logging.info(f"🚀 VRAI TOKEN VALIDE ! Nom: {name} ({symbol}) | Mint: {mint_address}")
+                                                success = await execute_buy_order(mint_address, wallet)
+                                                if success:
+                                                    asyncio.create_task(monitor_position(mint_address, symbol))
+                                            else:
+                                                logging.info(f"🛑 Token ignoré ({symbol}) : {reason}")
+                                    except Exception:
+                                        pass
 
         except Exception as e:
             logging.error(f"⚠️ Erreur WebSocket ({e}). Reconnexion dans 3s...")
@@ -241,7 +287,7 @@ async def start_web_server():
     logging.info(f"🌐 Mini-serveur HTTP actif sur le port {port}")
 
 async def main():
-    logging.info("🚀 Bot PumpFun démarré en mode ÉQUILIBRÉ (SÉCURITÉ & RENTABILITÉ)")
+    logging.info("🚀 Bot PumpFun démarré en mode LIVE PRODUCTION")
     await asyncio.gather(
         start_web_server(),
         listen_pumpfun_mints()
