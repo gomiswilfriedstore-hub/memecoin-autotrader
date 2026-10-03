@@ -66,7 +66,9 @@ SOL_RESERVE = 0.02       # SOL gardés pour frais/rent (ne pas mettre 0)
 BUY_FRACTION = 0.30      # chaque achat utilise 30% des fonds disponibles (hors réserve)
 MIN_BUY_SOL = 0.02       # taille d'achat minimale ; en dessous, le bot n'achète pas (mais continue de scanner)
 STAGNATION_SEC = 180     # pas de nouveau plus haut pendant 3 min -> vente totale
-CONFIRM_WAIT = 8         # s d'attente après un achat pour que le solde se mette à jour
+CONFIRM_WAIT = 2         # s d'attente après un achat confirmé
+CONFIRM_TIMEOUT = 40     # s max pour qu'une transaction soit confirmée sur la blockchain
+TX_RETRIES = 3           # nouvelles tentatives si la transaction a échoué (slippage, etc.)
 SLIPPAGE = 25            # %
 PRIORITY_FEE = 0.001     # SOL
 SCAN_EVERY = 10          # s
@@ -78,7 +80,7 @@ WS_URL = "wss://pumpportal.fun/api/data"   # flux gratuit des nouveaux tokens
 MONITOR_EVERY = 3        # s
 BLIND_SELL_SEC = 90      # pas de prix pendant 90 s -> vente totale de sécurité
 
-S = {"on": False, "pos": {}, "seen": {}, "bought": set(), "sampled": False, "tracked": {}, "scan_pause": 0, "sol_usd": 0.0, "sol_ts": 0, "ws": None, "trades_n": 0, "virtual": None, "stats": {}, "stats_ts": time.time()}
+S = {"on": False, "pos": {}, "seen": {}, "bought": set(), "sampled": False, "fail": {}, "tracked": {}, "scan_pause": 0, "sol_usd": 0.0, "sol_ts": 0, "ws": None, "trades_n": 0, "virtual": None, "stats": {}, "stats_ts": time.time()}
 RECHECK_AFTER = 60  # s : un coin refusé est réévalué après 60 s (volume/txs évoluent)
 
 
@@ -257,22 +259,91 @@ async def available(s) -> float:
     return await sol_balance(s)
 
 
+class TxUncertain(Exception):
+    """Transaction envoyée mais statut inconnu après le délai : on vérifie via le solde de tokens."""
+    def __init__(self, sig):
+        super().__init__(f"transaction non confirmée après {CONFIRM_TIMEOUT}s ({sig})")
+        self.sig = sig
+
+
+async def confirm(s, sig):
+    """-> 'ok' | 'failed:<erreur>' | 'unknown'  (vérifie vraiment sur la blockchain)."""
+    t0 = time.time()
+    while time.time() - t0 < CONFIRM_TIMEOUT:
+        res = await rpc(s, "getSignatureStatuses", [[sig], {"searchTransactionHistory": True}])
+        st = ((res or {}).get("value") or [None])[0]
+        if st:
+            if st.get("err"):
+                return "failed:" + json.dumps(st["err"])
+            if st.get("confirmationStatus") in ("confirmed", "finalized"):
+                return "ok"
+        await asyncio.sleep(1.5)
+    return "unknown"
+
+
+async def token_balance(s, mint) -> float:
+    res = await rpc(s, "getTokenAccountsByOwner", [str(KP.pubkey()), {"mint": mint}, {"encoding": "jsonParsed"}])
+    return sum(float(a["account"]["data"]["parsed"]["info"]["tokenAmount"]["uiAmount"] or 0)
+               for a in ((res or {}).get("value") or []))
+
+
+async def tx_sol_delta(s, sig):
+    """Variation réelle du solde SOL du wallet causée par la transaction (frais inclus), ou None."""
+    try:
+        res = await rpc(s, "getTransaction", [sig, {"encoding": "json", "commitment": "confirmed",
+                                                    "maxSupportedTransactionVersion": 0}])
+        meta = res["meta"]
+        return (meta["postBalances"][0] - meta["preBalances"][0]) / 1e9   # index 0 = notre wallet (payeur)
+    except Exception:
+        return None
+
+
 async def trade(s, action, mint, amount, in_sol):
+    """Envoie l'ordre ET attend sa confirmation. Retourne la signature, ou lève une erreur."""
     if DRY_RUN:
         log.info("[DRY_RUN] %s %s amount=%s", action, mint, amount)
         return "dry-run"
-    payload = dict(publicKey=str(KP.pubkey()), action=action, mint=mint, amount=amount,
-                   denominatedInSol="true" if in_sol else "false",
-                   slippage=SLIPPAGE, priorityFee=PRIORITY_FEE, pool="auto")
-    async with s.post("https://pumpportal.fun/api/trade-local", data=payload) as r:
-        if r.status != 200:
-            raise RuntimeError(await r.text())
-        raw = await r.read()
-    tx = VersionedTransaction(VersionedTransaction.from_bytes(raw).message, [KP])
-    body = SendVersionedTransaction(
-        tx, RpcSendTransactionConfig(preflight_commitment=CommitmentLevel.Confirmed)).to_json()
-    async with s.post(RPC_URL, data=body, headers={"Content-Type": "application/json"}) as r:
-        return (await r.json()).get("result")
+    last = "?"
+    for attempt in range(1, TX_RETRIES + 1):
+        payload = dict(publicKey=str(KP.pubkey()), action=action, mint=mint, amount=amount,
+                       denominatedInSol="true" if in_sol else "false",
+                       slippage=SLIPPAGE, priorityFee=PRIORITY_FEE, pool="auto")
+        async with s.post("https://pumpportal.fun/api/trade-local", data=payload) as r:
+            if r.status != 200:
+                last = f"PumpPortal {r.status}: {(await r.text())[:150]}"
+                await asyncio.sleep(1)
+                continue
+            raw = await r.read()
+        tx = VersionedTransaction(VersionedTransaction.from_bytes(raw).message, [KP])
+        body = SendVersionedTransaction(
+            tx, RpcSendTransactionConfig(preflight_commitment=CommitmentLevel.Confirmed)).to_json()
+        async with s.post(RPC_URL, data=body, headers={"Content-Type": "application/json"}) as r:
+            resp = await r.json()
+        sig = resp.get("result")
+        if not sig:
+            last = f"envoi refusé: {str(resp.get('error'))[:150]}"   # rien n'est parti : on peut réessayer
+            await asyncio.sleep(1)
+            continue
+        status = await confirm(s, sig)
+        if status == "ok":
+            return sig
+        if status == "unknown":
+            raise TxUncertain(sig)          # peut-être passée plus tard : ne PAS renvoyer (risque de doublon)
+        last = f"{status} (tentative {attempt}/{TX_RETRIES})"   # échec confirmé on-chain : on réessaie
+        log.warning("%s %s: %s", action, mint, last)
+    raise RuntimeError(f"échec après {TX_RETRIES} tentatives: {last}")
+
+
+async def buy(s, mint, size):
+    """Achat vérifié. -> (signature, coût réel en SOL)."""
+    try:
+        sig = await trade(s, "buy", mint, size, True)
+    except TxUncertain as e:
+        if await token_balance(s, mint) <= 0:
+            raise RuntimeError(f"achat non confirmé et aucun token reçu ({e.sig})")
+        sig = e.sig                         # les tokens sont bien arrivés
+    delta = await tx_sol_delta(s, sig) if not DRY_RUN else None
+    return sig, (-delta if delta and delta < 0 else size)
 
 
 async def notify(app, text):
@@ -407,14 +478,21 @@ async def scanner(app):
                     if size < MIN_BUY_SOL or not metric:
                         break
                     size = round(size, 4)
-                    sig = await trade(s, "buy", m, size, True)
+                    try:
+                        sig, size = await buy(s, m, size)   # attend la confirmation on-chain
+                    except Exception as e:
+                        S["fail"][m] = S["fail"].get(m, 0) + 1
+                        if S["fail"][m] >= 2:
+                            S["bought"].add(m)              # 2 échecs : on abandonne ce coin
+                        await notify(app, f"⚠️ Achat ÉCHOUÉ {c['symbol']} ({m}): {e}\nAucune position ouverte.")
+                        continue
                     if DRY_RUN:
                         S["virtual"] -= size
                     S["bought"].add(m)
                     S["pos"][m] = dict(symbol=c["symbol"], entry=metric, peak=metric, last=metric,
                                        next_tier=metric * TIER_MULT, cost=size, frac=1.0,
                                        last_high=time.time(), blind=None)
-                    await notify(app, f"🟢 ACHAT {c['symbol']} ({m})\n{size} SOL @ mcap ${c['mcap']:,.0f}\ntx: {sig}")
+                    await notify(app, f"🟢 ACHAT confirmé {c['symbol']} ({m})\n{size:.4f} SOL @ mcap ${c['mcap']:,.0f}\n{tx_link(sig)}")
                     await asyncio.sleep(CONFIRM_WAIT)
                     break
         except Exception as e:
@@ -425,14 +503,32 @@ async def scanner(app):
             S["stats"], S["stats_ts"], S["trades_n"] = {}, time.time(), 0
 
 
+def tx_link(sig):
+    return "tx: simulation (DRY_RUN)" if sig == "dry-run" else f"tx: https://solscan.io/tx/{sig}"
+
+
 async def sell(app, s, mint, pct, reason, price):
+    """Vente vérifiée : l'état de la position ne change qu'après confirmation."""
     p = S["pos"][mint]
-    sig = await trade(s, "sell", mint, f"{pct}%", False)
-    proceeds = p["cost"] * p["frac"] * (pct / 100) * (price / p["entry"])  # estimation
+    before = await token_balance(s, mint) if not DRY_RUN else None
+    if before is not None and before <= 0:
+        del S["pos"][mint]
+        await notify(app, f"ℹ️ {p['symbol']}: aucun token restant, position retirée.")
+        return
+    try:
+        sig = await trade(s, "sell", mint, f"{pct}%", False)
+    except TxUncertain as e:
+        after = await token_balance(s, mint)
+        if after >= before * 0.999:
+            raise RuntimeError(f"vente non confirmée, tokens inchangés ({e.sig}) : nouvelle tentative")
+        sig = e.sig                         # les tokens ont bien diminué : la vente est passée
+    delta = await tx_sol_delta(s, sig) if not DRY_RUN else None
+    proceeds = delta if delta is not None else p["cost"] * p["frac"] * (pct / 100) * (price / p["entry"])
     p["frac"] *= 1 - pct / 100
     if DRY_RUN:
         S["virtual"] += proceeds
-    await notify(app, f"🔴 {reason}: vente {pct}% {p['symbol']} à x{price / p['entry']:.2f} (≈{proceeds:.3f} SOL)\ntx: {sig}")
+    await notify(app, f"🔴 {reason}: vente {pct}% {p['symbol']} à x{price / p['entry']:.2f} "
+                      f"({'+' if proceeds >= 0 else ''}{proceeds:.3f} SOL {'reçus' if delta is not None else 'estimés'})\n{tx_link(sig)}")
     if pct == 100:
         del S["pos"][mint]
 
@@ -483,6 +579,9 @@ async def monitor(app):
                     await sell(app, s, mint, 100, f"STAGNATION {STAGNATION_SEC // 60} min", price)
             except Exception as e:
                 throttled_warn("monitor_" + mint, f"monitor {mint}: {e}")
+                if time.time() - p.get("fail_notif", 0) > 60:
+                    p["fail_notif"] = time.time()
+                    await notify(app, f"⚠️ Vente en échec {p['symbol']}: {e}\nNouvelle tentative automatique.")
 
 
 # ----------------------------- TELEGRAM -------------------------------
@@ -527,6 +626,44 @@ async def cmd_sellall(u, ctx):
             await u.message.reply_text(f"Échec vente {p['symbol']}: {e}")
 
 
+def find_fee_fields(obj, path="", out=None, depth=0):
+    out = {} if out is None else out
+    if depth > 4:
+        return out
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if "fee" in str(k).lower() and not isinstance(v, (dict, list)):
+                out[path + k] = v
+            find_fee_fields(v, path + str(k) + ".", out, depth + 1)
+    elif isinstance(obj, list) and obj:
+        find_fee_fields(obj[0], path + "[0].", out, depth + 1)
+    return out
+
+
+@owner_only
+async def cmd_fees(u, ctx):
+    """/fees <mint> : cherche un champ « frais » dans l'API pump.fun pour ce coin (diagnostic)."""
+    if not ctx.args:
+        await u.message.reply_text("Usage : /fees <adresse du coin>")
+        return
+    s, mint, lines = ctx.application.bot_data["session"], ctx.args[0], []
+    for url in (f"https://frontend-api-v3.pump.fun/coins/{mint}?sync=true",
+                f"https://frontend-api-v3.pump.fun/coins/{mint}"):
+        try:
+            async with s.get(url, headers={"Origin": "https://pump.fun"}, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                status = r.status
+                data = await r.json(content_type=None) if status == 200 else None
+        except Exception as e:
+            lines.append(f"{url.split('/coins/')[1][-12:]} : erreur {e}")
+            continue
+        if data is None:
+            lines.append(f"HTTP {status}")
+            continue
+        lines.append(f"HTTP 200 | champs 'fee' : {find_fee_fields(data) or 'aucun'}")
+        break
+    await u.message.reply_text("\n".join(lines)[:3500])
+
+
 async def start_health():
     """Mini serveur HTTP : Render (Web Service) exige un port ouvert, et sert aussi au ping anti-veille."""
     srv = web.Application()
@@ -546,7 +683,7 @@ async def post_init(app):
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
-    for name, fn in [("on", cmd_on), ("off", cmd_off), ("status", cmd_status), ("sellall", cmd_sellall)]:
+    for name, fn in [("on", cmd_on), ("off", cmd_off), ("status", cmd_status), ("sellall", cmd_sellall), ("fees", cmd_fees)]:
         app.add_handler(CommandHandler(name, fn))
     app.run_polling()
 
