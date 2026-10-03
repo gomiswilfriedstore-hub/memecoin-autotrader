@@ -1,421 +1,334 @@
-import os
-import json
-import time
+"""
+Bot Telegram - pump.fun "Top movers" auto-trader
+Filtres = ceux des captures d'écran (Audit 4 + Métriques 4 = 8 filtres).
+Achat : tout le solde SOL dispo (moins une réserve de frais). Le scan continue
+        tant qu'il reste assez de SOL : plusieurs positions peuvent coexister.
+Sortie : vend 80% du restant à chaque palier de +50% (calculé depuis le prix de
+         la dernière vente), stop loss -25%, et vente totale si aucun nouveau
+         plus haut pendant 3 min (stagnation).
+
+Commandes Telegram : /on /off /status /sellall
+Lance d'abord en DRY_RUN=true pour vérifier que tout fonctionne.
+"""
 import asyncio
-import logging
 import base64
-import struct
+import logging
+import os
+import time
+
 import aiohttp
-from aiohttp import web
-import websockets
 import base58
-from collections import OrderedDict
-
-from solana.rpc.async_api import AsyncClient
+from dotenv import load_dotenv
+from solders.commitment_config import CommitmentLevel
 from solders.keypair import Keypair
-from solders.pubkey import Pubkey
+from solders.rpc.config import RpcSendTransactionConfig
+from solders.rpc.requests import SendVersionedTransaction
 from solders.transaction import VersionedTransaction
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-# ==========================================
-# NETTOYAGE GLOBAL DES VARIABLES D'ENVIRONNEMENT
-# ==========================================
-for env_key, env_val in list(os.environ.items()):
-    if isinstance(env_val, str):
-        os.environ[env_key] = env_val.strip().replace("\n", "").replace("\r", "")
+load_dotenv()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+log = logging.getLogger("pumpbot")
 
-# ==========================================
-# CONFIGURATION DES LOGS & ENVIRONNEMENT
-# ==========================================
+# ----------------------------- CONFIG ---------------------------------
+TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+OWNER_ID = int(os.environ["OWNER_ID"])          # seul ton compte peut commander le bot
+RPC_URL = os.environ["RPC_URL"]                 # idéalement un RPC Helius (holders via DAS)
+KP = Keypair.from_bytes(base58.b58decode(os.environ["PRIVATE_KEY"]))
+DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
+# Filtres lus sur tes captures (None = pas de filtre)
+FILTERS = dict(
+    holders_min=200,
+    age_max_min=60,
+    top10_max_pct=14,
+    dev_max_pct=14,
+    mcap_min_usd=10_000,
+    fees_max_sol=0.5,
+    volume24h_min_usd=40_000,
+    buys_min=200,
 )
 
-# Vos paramètres inchangés
-BUY_AMOUNT_SOL = 0.02  
-MIN_HOLDERS_REQUIRED = 100  
-INITIAL_STOP_LOSS_PCT = -10.0  
-BASE_TRAILING_PCT = 10.0       
-WIDE_TRAILING_PCT = 20.0       
-BREAKEVEN_TRIGGER_PCT = 25.0   
-MAX_HOLD_TIME_SEC = 180        
+# Stratégie de sortie
+TIER_MULT = 1.5          # palier = +50%
+TIER_SELL_PCT = 80       # on vend 80% du restant à chaque palier
+STOP_LOSS = 0.25         # -25%
+STOP_FROM_PEAK = True    # True = trailing (depuis le plus haut) / False = depuis le prix d'entrée
 
-# Blacklist affinée
-BANNED_NAMES = [
-    "YO", "TEST", "PUMP", "SOL", "UNKNOWN", "NULL", "MOON", 
-    "MEME", "COIN", "DOGE", "PEPE", "SHIB", "DEV", "ANON", "INU", "ELON",
-    "ETF", "AI", "AIRDROP", "CLAIM", "SAFE", "BABY", "CAT", "DDOS", "PUMPFUN"
-]
+# Exécution
+SOL_RESERVE = 0.02       # SOL gardés pour frais/rent (ne pas mettre 0)
+MIN_BUY_SOL = 0.05       # en dessous, le bot n'achète pas (mais continue de scanner)
+STAGNATION_SEC = 180     # pas de nouveau plus haut pendant 3 min -> vente totale
+CONFIRM_WAIT = 8         # s d'attente après un achat pour que le solde se mette à jour
+SLIPPAGE = 25            # %
+PRIORITY_FEE = 0.001     # SOL
+SCAN_EVERY = 5           # s
+MONITOR_EVERY = 2        # s
 
-PUMPFUN_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+S = {"on": False, "pos": {}, "seen": {}, "bought": set(), "sampled": False, "virtual": None}
+RECHECK_AFTER = 60  # s : un coin refusé est réévalué après 60 s (volume/txs évoluent)
 
-SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://mainnet.helius-rpc.com/?api-key=7d50ec7c-921b-4281-8eb7-4d1b1e5f61a2")
-solana_client = AsyncClient(SOLANA_RPC_URL)
 
-trade_semaphore = asyncio.Semaphore(2)
+# ----------------------------- DONNÉES --------------------------------
+# ⚠️ L'onglet "Top movers" n'a pas d'API publique documentée. Cette partie
+# utilise l'API frontend de pump.fun (non officielle, peut changer) : adapte
+# CANDIDATES_URL et parse_coin() si les noms de champs ne correspondent pas.
+CANDIDATES_URL = ("https://frontend-api-v3.pump.fun/coins"
+                  "?offset=0&limit=50&sort=last_trade_timestamp&order=DESC&includeNsfw=false")
+COIN_URL = "https://frontend-api-v3.pump.fun/coins/{mint}"
 
-processed_tokens = OrderedDict()
-MAX_PROCESSED_CACHE = 1000
-active_positions_count = 0
 
-# ==========================================
-# CHARGEMENT DU WALLET
-# ==========================================
-
-def load_wallet() -> Keypair:
-    pk_env = os.getenv("SOLANA_PRIVATE_KEY")
-    if not pk_env:
-        raise ValueError("❌ Aucune clé privée 'SOLANA_PRIVATE_KEY' trouvée dans l'environnement !")
-    
-    if pk_env.startswith("["):
-        secret_key = json.loads(pk_env)
-        if len(secret_key) == 32:
-            return Keypair.from_seed(bytes(secret_key))
-        return Keypair.from_bytes(bytes(secret_key))
-    else:
-        try:
-            decoded = base58.b58decode(pk_env)
-            if len(decoded) == 32:
-                return Keypair.from_seed(decoded)
-            elif len(decoded) == 64:
-                return Keypair.from_bytes(decoded)
-            else:
-                return Keypair.from_base58_string(pk_env)
-        except Exception:
-            return Keypair.from_base58_string(pk_env)
-
-async def check_wallet_balance(wallet: Keypair) -> float:
-    try:
-        balance_resp = await solana_client.get_balance(wallet.pubkey())
-        lamports = balance_resp.value if hasattr(balance_resp, "value") else balance_resp.get("result", {}).get("value", 0)
-        sol_balance = lamports / 1e9
-        return sol_balance
-    except Exception as e:
-        logging.error(f"❌ Impossible de récupérer le solde du wallet : {e}")
-        return 0.0
-
-# ==========================================
-# PARSEUR DES LOGS PUMPFUN
-# ==========================================
-
-def read_length_prefixed_string(data, offset):
-    length = struct.unpack('<I', data[offset:offset + 4])[0]
-    offset += 4
-    string_data = data[offset:offset + length]
-    offset += length
-    return string_data.decode('utf-8', errors='ignore').strip('\x00').strip().replace("\n", "").replace("\r", ""), offset
-
-def read_pubkey(data, offset):
-    pubkey_data = data[offset:offset + 32]
-    offset += 32
-    pubkey = str(Pubkey.from_bytes(pubkey_data))
-    return pubkey.strip().replace("\n", "").replace("\r", ""), offset
-
-def parse_pumpfun_event(program_data_hex):
-    try:
-        data_bytes = bytes.fromhex(program_data_hex)
-        offset = 8  
-        
-        event_data = {}
-        event_data['name'], offset = read_length_prefixed_string(data_bytes, offset)
-        event_data['symbol'], offset = read_length_prefixed_string(data_bytes, offset)
-        event_data['uri'], offset = read_length_prefixed_string(data_bytes, offset)
-        event_data['mint'], offset = read_pubkey(data_bytes, offset)
-        event_data['bonding_curve'], offset = read_pubkey(data_bytes, offset)
-        event_data['user'], offset = read_pubkey(data_bytes, offset)
-        
-        return event_data
-    except Exception:
-        return None
-
-# ==========================================
-# RÉCUPÉRATION DES MÉTRIQUES DE MARCHÉ
-# ==========================================
-
-async def fetch_token_market_data(mint: str) -> dict:
-    clean_mint = mint.strip().replace("\n", "").replace("\r", "")
-    url = f"https://pumpportal.fun/api/data/token/{clean_mint}"
-    
-    for attempt in range(4):
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=3.5) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        if data and isinstance(data, dict) and len(data) > 0:
-                            return data
-        except Exception:
-            pass
-        await asyncio.sleep(0.6)
-        
-    return {}
-
-# ==========================================
-# FILTRE RAPIDE (ANTI-BLACKLIST)
-# ==========================================
-
-def validate_token_quick(token_data: dict) -> tuple[bool, str]:
-    symbol = token_data.get("symbol", "").strip()
-    name = token_data.get("name", "").strip()
-    mint = token_data.get("mint", "").strip()
-
-    if mint in processed_tokens:
-        return False, "Token déjà traité"
-
-    upper_symbol = symbol.upper()
-    upper_name = name.upper()
-    if upper_symbol in BANNED_NAMES or any(banned in upper_name for banned in BANNED_NAMES if len(banned) > 2):
-        return False, f"Nom/Symbole suspect ('{symbol}')"
-
-    processed_tokens[mint] = True
-    if len(processed_tokens) > MAX_PROCESSED_CACHE:
-        processed_tokens.popitem(last=False)
-
-    return True, "Nom valide"
-
-# ==========================================
-# EXÉCUTION DES TRADES (AVEC RETENTATIVE DE VENTE)
-# ==========================================
-
-async def execute_trade(mint_str: str, wallet: Keypair, action: str, amount_val=None) -> bool:
-    async with trade_semaphore:
-        max_retries = 5 if action == "sell" else 2  # Insiste beaucoup plus sur les ventes pour éviter de bloquer
-        
-        for attempt in range(1, max_retries + 1):
-            try:
-                current_balance = await check_wallet_balance(wallet)
-                if current_balance < 0.0005 and action == "sell":
-                    logging.warning(f"⚠️ Solde SOL très bas ({current_balance:.5f}), la vente de {mint_str} risque d'échouer faute de frais.")
-
-                if current_balance < BUY_AMOUNT_SOL and action == "buy":
-                    logging.error(f"❌ Achat annulé : Solde de SOL insuffisant ({current_balance:.4f} SOL < {BUY_AMOUNT_SOL} SOL).")
-                    return False
-
-                clean_mint = mint_str.strip().replace("\n", "").replace("\r", "")
-                clean_pubkey = str(wallet.pubkey()).strip().replace("\n", "").replace("\r", "")
-                
-                url = "https://pumpportal.fun/api/trade-local"
-                
-                payload = {
-                    "publicKey": clean_pubkey,
-                    "action": action,
-                    "mint": clean_mint,
-                    "denominatedInSol": "true" if action == "buy" else "false",
-                    "amount": amount_val if action == "buy" else "100%",
-                    "slippage": 25,        
-                    "priorityFee": 0.002 * attempt,  # Augmente les frais prioritaires à chaque essai si la vente bloque
-                    "pool": "pump"
-                }
-
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(url, json=payload, timeout=5) as resp:
-                        if resp.status != 200:
-                            error_text = await resp.text()
-                            logging.error(f"❌ Erreur API PumpPortal ({action.upper()}) [Essai {attempt}/{max_retries}] : {error_text}")
-                            await asyncio.sleep(1)
-                            continue
-                        raw_data = await resp.read()
-
-                tx = VersionedTransaction.from_bytes(raw_data)
-                signed_tx = VersionedTransaction(tx.message, [wallet])
-                
-                rpc_payload = {
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "sendTransaction",
-                    "params": [
-                        base64.b64encode(bytes(signed_tx)).decode('utf-8'),
-                        {"encoding": "base64", "skipPreflight": True, "maxRetries": 3}
-                    ]
-                }
-
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(SOLANA_RPC_URL, json=rpc_payload, timeout=5) as resp:
-                        res_json = await resp.json()
-                        if "error" in res_json:
-                            logging.error(f"❌ Erreur RPC Solana ({action.upper()}) [Essai {attempt}/{max_retries}] : {res_json['error']}")
-                            await asyncio.sleep(1)
-                            continue
-                        sig_str = res_json.get("result")
-
-                logging.info(f"🎯 [{action.upper()}] Succès ! https://solscan.io/tx/{sig_str}")
-                return True
-
-            except Exception as e:
-                logging.error(f"❌ Exception trade {action} sur {mint_str} [Essai {attempt}/{max_retries}]: {e}")
-                await asyncio.sleep(1.5)
-
-        logging.error(f"🚨 ÉCHEC CRITIQUE : Impossible d'exécuter l'action {action} sur {mint_str} après {max_retries} essais !")
-        return False
-
-async def fetch_token_price(mint: str) -> float:
-    data = await fetch_token_market_data(mint)
-    return float(data.get("price", 0.0) or 0.0)
-
-async def monitor_position(mint: str, symbol: str, wallet: Keypair):
-    global active_positions_count
-    active_positions_count += 1
-    clean_mint = mint.strip().replace("\n", "").replace("\r", "")
-    
-    # Attente de 5 secondes (inchangée)
-    await asyncio.sleep(5.0)
-    
-    market_data = await fetch_token_market_data(clean_mint)
-    if not market_data:
-        await asyncio.sleep(1.0)
-        market_data = await fetch_token_market_data(clean_mint)
-
-    holders_count = int(market_data.get("holders", 0) or 0)
-    
-    # Sécurité Holders (100 min)
-    if holders_count < MIN_HOLDERS_REQUIRED:
-        logging.warning(f"🛑 [SÉCURITÉ HOLDERS] {symbol} rejeté : Seulement {holders_count} détenteur(s) (Minimum requis : {MIN_HOLDERS_REQUIRED}). Vente immédiate...")
-        await execute_trade(clean_mint, wallet, "sell")
-        active_positions_count = max(0, active_positions_count - 1)
-        return
-
-    entry_price = float(market_data.get("price", 0.0) or 0.0)
-    if entry_price <= 0:
-        entry_price = 0.000001
-        
-    highest_price = entry_price
-    start_time = time.time()
-    
-    stop_loss_price = entry_price * (1 + (INITIAL_STOP_LOSS_PCT / 100.0))
-    breakeven_secured = False
-
-    logging.info(f"🛡️ [SUIVI] Position active sur {symbol} | Holders: {holders_count} | Entrée: {entry_price} | SL: {stop_loss_price:.6f}")
-
-    try:
-        while True:
-            await asyncio.sleep(1.0) 
-            current_price = await fetch_token_price(clean_mint)
-            elapsed_time = time.time() - start_time
-            
-            # Si le prix renvoie 0 ou bugue temporairement, on ignore cette seconde pour ne pas vendre par erreur sur un faux bug réseau
-            if current_price <= 0:
-                if elapsed_time >= MAX_HOLD_TIME_SEC:
-                    logging.warning(f"⚠️ [CLÔTURE TEMPORELLE] {symbol} - Prix indisponible, forçage de la vente après {MAX_HOLD_TIME_SEC}s.")
-                    await execute_trade(clean_mint, wallet, "sell")
-                    break
-                continue
-
-            current_pnl_pct = ((current_price - entry_price) / entry_price) * 100
-            peak_pnl_pct = ((highest_price - entry_price) / entry_price) * 100
-
-            if current_price > highest_price:
-                highest_price = current_price
-                peak_pnl_pct = ((highest_price - entry_price) / entry_price) * 100
-
-            if peak_pnl_pct >= BREAKEVEN_TRIGGER_PCT and not breakeven_secured:
-                stop_loss_price = entry_price * 1.01  
-                breakeven_secured = True
-                logging.info(f"🛡️ [BREAKEVEN] {symbol} sécurisé à l'entrée.")
-
-            active_trailing = WIDE_TRAILING_PCT if peak_pnl_pct >= 100.0 else BASE_TRAILING_PCT
-            if peak_pnl_pct > 0:
-                new_stop = highest_price * (1 - (active_trailing / 100.0))
-                if new_stop > stop_loss_price:
-                    stop_loss_price = new_stop
-
-            # Déclenchement de la vente si Stop Loss franchi ou temps max atteint
-            if current_price <= stop_loss_price or elapsed_time >= MAX_HOLD_TIME_SEC:
-                reason = "Stop Loss / Trailing" if current_price <= stop_loss_price else "Temps Max (3 min)"
-                logging.info(f"⚡ [CLÔTURE - {reason}] {symbol} - PnL: {current_pnl_pct:.2f}% | Temps: {elapsed_time:.1f}s")
-                await execute_trade(clean_mint, wallet, "sell")
-                break
-    finally:
-        active_positions_count = max(0, active_positions_count - 1)
-        new_balance = await check_wallet_balance(wallet)
-        logging.info(f"💼 Position fermée. Solde actuel du wallet : {new_balance:.4f} SOL")
-
-# ==========================================
-# WEBSOCKET PUMPFUN
-# ==========================================
-
-async def listen_pumpfun_mints():
-    wallet = load_wallet()
-    uri = os.getenv("SOLANA_WSS_URI", "wss://mainnet.helius-rpc.com/?api-key=7d50ec7c-921b-4281-8eb7-4d1b1e5f61a2")
-    
-    reconnect_delay = 3
-    while True:
-        try:
-            async with websockets.connect(uri) as websocket:
-                reconnect_delay = 3
-                sub_payload = {
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "logsSubscribe",
-                    "params": [{"mentions": [PUMPFUN_PROGRAM_ID]}, {"commitment": "processed"}]
-                }
-                await websocket.send(json.dumps(sub_payload))
-                logging.info("🔗 Connecté au WebSocket Solana - Mode Anti-Blocage Vente Actif...")
-
-                while True:
-                    response = await websocket.recv()
-                    data = json.loads(response)
-                    
-                    if "params" in data:
-                        logs = data["params"]["result"]["value"]["logs"]
-                        logs_str = "".join(logs)
-                        
-                        if "Instruction: InitializeMint" in logs_str or "Instruction: Create" in logs_str:
-                            current_sol_balance = await check_wallet_balance(wallet)
-                            if current_sol_balance < BUY_AMOUNT_SOL:
-                                continue
-
-                            for log_entry in logs:
-                                if "Program data: " in log_entry:
-                                    try:
-                                        base64_data = log_entry.split("Program data: ")[1].strip()
-                                        hex_data = base64.b64decode(base64_data).hex()
-                                        token_info = parse_pumpfun_event(hex_data)
-                                        
-                                        if token_info and 'mint' in token_info:
-                                            mint_address = token_info['mint'].strip()
-                                            symbol = token_info['symbol'].strip()
-                                            name = token_info['name'].strip()
-                                            
-                                            is_valid, reason = validate_token_quick(token_info)
-                                            if is_valid:
-                                                logging.info(f"🚀 NOUVEAU TOKEN DÉTECTÉ ({name} / {symbol}) - Achat immédiat à {BUY_AMOUNT_SOL} SOL !")
-                                                success = await execute_trade(mint_address, wallet, "buy", BUY_AMOUNT_SOL)
-                                                if success:
-                                                    asyncio.create_task(monitor_position(mint_address, symbol, wallet))
-                                    except Exception:
-                                        pass
-
-        except Exception as e:
-            logging.error(f"⚠️ Erreur WebSocket ({e}). Reconnexion dans {reconnect_delay}s...")
-            await asyncio.sleep(reconnect_delay)
-            reconnect_delay = min(reconnect_delay * 2, 30)
-
-# ==========================================
-# SERVEUR HTTP & MAIN
-# ==========================================
-
-async def handle_health_check(request):
-    return web.Response(text="Bot PumpFun Anti-Blocage Vente Actif 🚀")
-
-async def start_web_server():
-    app = web.Application()
-    app.router.add_get('/', handle_health_check)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    
-    port = int(os.getenv("PORT", 10000))
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
-    logging.info(f"🌐 Mini-serveur HTTP actif sur le port {port}")
-
-async def main():
-    logging.info("🚀 Bot PumpFun démarré - Version avec Sécurité de Vente Renforcée (Retentatives automatiques)")
-    await asyncio.gather(
-        start_web_server(),
-        listen_pumpfun_mints()
+def parse_coin(c: dict) -> dict:
+    g = c.get
+    return dict(
+        mint=g("mint"),
+        creator=g("creator"),
+        curve_ata=g("associated_bonding_curve"),
+        age_min=(time.time() * 1000 - g("created_timestamp", 0)) / 60000 if g("created_timestamp") else None,
+        mcap=g("usd_market_cap"),
+        volume24h=g("volume_24h") or g("volume"),     # à vérifier
+        buys=g("buy_count") or g("buys"),             # à vérifier
+        fees_sol=g("total_fees_sol") or g("fees"),    # à vérifier
+        symbol=g("symbol"),
     )
 
+
+async def get_json(s, url):
+    async with s.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+        r.raise_for_status()
+        return await r.json()
+
+
+async def rpc(s, method, params):
+    body = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+    async with s.post(RPC_URL, json=body) as r:
+        return (await r.json()).get("result")
+
+
+async def top10_pct(s, coin):
+    res = await rpc(s, "getTokenLargestAccounts", [coin["mint"]])
+    if not res:
+        return None
+    accs = [a for a in res["value"] if a["address"] != coin["curve_ata"]]  # exclut la bonding curve
+    return sum(float(a["uiAmount"] or 0) for a in accs[:10]) / 1e9 * 100   # supply pump.fun = 1B
+
+
+async def dev_pct(s, coin):
+    res = await rpc(s, "getTokenAccountsByOwner",
+                    [coin["creator"], {"mint": coin["mint"]}, {"encoding": "jsonParsed"}])
+    if res is None:
+        return None
+    tot = sum(float(a["account"]["data"]["parsed"]["info"]["tokenAmount"]["uiAmount"] or 0)
+              for a in res["value"])
+    return tot / 1e9 * 100
+
+
+async def holders_ok(s, coin, minimum):
+    """Helius DAS : on a juste besoin de savoir si holders >= minimum."""
+    res = await rpc(s, "getTokenAccounts", {"mint": coin["mint"], "limit": 1000})
+    if not res:
+        return None
+    return sum(1 for a in res["token_accounts"] if int(a.get("amount", 0)) > 0) >= minimum
+
+
+async def passes(s, c) -> bool:
+    f = FILTERS
+    # filtres rapides d'abord (fail closed : donnée absente = rejet)
+    quick = [
+        (c["age_min"], lambda v: v <= f["age_max_min"]),
+        (c["mcap"], lambda v: v >= f["mcap_min_usd"]),
+        (c["volume24h"], lambda v: v >= f["volume24h_min_usd"]),
+        (c["buys"], lambda v: v >= f["buys_min"]),
+        (c["fees_sol"], lambda v: v <= f["fees_max_sol"]),
+    ]
+    for val, ok in quick:
+        if val is None or not ok(val):
+            return False
+    # filtres coûteux (appels RPC)
+    t10 = await top10_pct(s, c)
+    if t10 is None or t10 > f["top10_max_pct"]:
+        return False
+    dv = await dev_pct(s, c)
+    if dv is None or dv > f["dev_max_pct"]:
+        return False
+    h = await holders_ok(s, c, f["holders_min"])
+    return bool(h)
+
+
+# ----------------------------- TRADING --------------------------------
+async def sol_balance(s) -> float:
+    res = await rpc(s, "getBalance", [str(KP.pubkey())])
+    return res["value"] / 1e9
+
+
+async def available(s) -> float:
+    """Solde utilisable. En DRY_RUN : portefeuille virtuel (achats/ventes simulés)."""
+    real = await sol_balance(s)
+    if not DRY_RUN:
+        return real
+    if S["virtual"] is None:
+        S["virtual"] = real
+    return S["virtual"]
+
+
+async def fetch_mc(s, mint):
+    return parse_coin(await get_json(s, COIN_URL.format(mint=mint)))["mcap"]
+
+
+async def trade(s, action, mint, amount, in_sol):
+    if DRY_RUN:
+        log.info("[DRY_RUN] %s %s amount=%s", action, mint, amount)
+        return "dry-run"
+    payload = dict(publicKey=str(KP.pubkey()), action=action, mint=mint, amount=amount,
+                   denominatedInSol="true" if in_sol else "false",
+                   slippage=SLIPPAGE, priorityFee=PRIORITY_FEE, pool="auto")
+    async with s.post("https://pumpportal.fun/api/trade-local", data=payload) as r:
+        if r.status != 200:
+            raise RuntimeError(await r.text())
+        raw = await r.read()
+    tx = VersionedTransaction(VersionedTransaction.from_bytes(raw).message, [KP])
+    body = SendVersionedTransaction(
+        tx, RpcSendTransactionConfig(preflight_commitment=CommitmentLevel.Confirmed)).to_json()
+    async with s.post(RPC_URL, data=body, headers={"Content-Type": "application/json"}) as r:
+        return (await r.json()).get("result")
+
+
+async def notify(app, text):
+    log.info(text)
+    await app.bot.send_message(OWNER_ID, text)
+
+
+# ----------------------------- BOUCLES --------------------------------
+async def scanner(app):
+    s = app.bot_data["session"]
+    while True:
+        await asyncio.sleep(SCAN_EVERY)
+        if not S["on"]:
+            continue
+        try:
+            if await available(s) - SOL_RESERVE < MIN_BUY_SOL:
+                continue  # pas assez de SOL : on attend qu'une vente en libère
+            coins = await get_json(s, CANDIDATES_URL)
+            if coins and not S["sampled"]:
+                log.info("SAMPLE COIN (brut): %s", coins[0])
+                log.info("SAMPLE COIN (parsé): %s", parse_coin(coins[0]))
+                S["sampled"] = True
+            for raw in coins:
+                c = parse_coin(raw)
+                m = c["mint"]
+                if not m or m in S["bought"] or time.time() - S["seen"].get(m, 0) < RECHECK_AFTER:
+                    continue
+                S["seen"][m] = time.time()
+                if not await passes(s, c):
+                    continue
+                size = await available(s) - SOL_RESERVE
+                if size < MIN_BUY_SOL:
+                    break
+                size = round(size, 4)
+                sig = await trade(s, "buy", m, size, True)
+                if DRY_RUN:
+                    S["virtual"] -= size
+                S["bought"].add(m)
+                S["pos"][m] = dict(symbol=c["symbol"], entry=c["mcap"], peak=c["mcap"],
+                                   next_tier=c["mcap"] * TIER_MULT, cost=size, frac=1.0,
+                                   last_high=time.time())
+                await notify(app, f"🟢 ACHAT {c['symbol']} ({m})\n{size} SOL @ mcap ${c['mcap']:,.0f}\ntx: {sig}")
+                await asyncio.sleep(CONFIRM_WAIT)
+                break
+        except Exception as e:
+            log.warning("scanner: %s", e)
+
+
+async def sell(app, s, mint, pct, reason, mc):
+    p = S["pos"][mint]
+    sig = await trade(s, "sell", mint, f"{pct}%", False)
+    proceeds = p["cost"] * p["frac"] * (pct / 100) * (mc / p["entry"])  # estimation
+    p["frac"] *= 1 - pct / 100
+    if DRY_RUN:
+        S["virtual"] += proceeds
+    await notify(app, f"🔴 {reason}: vente {pct}% {p['symbol']} @ ${mc:,.0f} (≈{proceeds:.3f} SOL)\ntx: {sig}")
+    if pct == 100:
+        del S["pos"][mint]
+
+
+async def monitor(app):
+    s = app.bot_data["session"]
+    while True:
+        await asyncio.sleep(MONITOR_EVERY)
+        for mint, p in list(S["pos"].items()):
+            try:
+                mc = await fetch_mc(s, mint)
+                if not mc:
+                    continue
+                now = time.time()
+                if mc > p["peak"]:
+                    p["peak"], p["last_high"] = mc, now
+                ref = p["peak"] if STOP_FROM_PEAK else p["entry"]
+                if mc <= ref * (1 - STOP_LOSS):
+                    await sell(app, s, mint, 100, "STOP LOSS", mc)
+                elif mc >= p["next_tier"]:
+                    await sell(app, s, mint, TIER_SELL_PCT, "PALIER +50%", mc)
+                    p["next_tier"] = mc * TIER_MULT  # +50% depuis le prix de cette vente
+                elif now - p["last_high"] >= STAGNATION_SEC:
+                    await sell(app, s, mint, 100, f"STAGNATION {STAGNATION_SEC // 60} min", mc)
+            except Exception as e:
+                log.warning("monitor %s: %s", mint, e)
+
+
+# ----------------------------- TELEGRAM -------------------------------
+def owner_only(fn):
+    async def w(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if u.effective_user.id == OWNER_ID:
+            await fn(u, ctx)
+    return w
+
+
+@owner_only
+async def cmd_on(u, ctx):
+    S["on"] = True
+    await u.message.reply_text(f"✅ Bot ON ({'DRY_RUN' if DRY_RUN else 'RÉEL'})")
+
+
+@owner_only
+async def cmd_off(u, ctx):
+    S["on"] = False
+    await u.message.reply_text("⏸ Bot OFF (la position ouverte reste surveillée)")
+
+
+@owner_only
+async def cmd_status(u, ctx):
+    s = ctx.application.bot_data["session"]
+    txt = f"{'ON' if S['on'] else 'OFF'} | {'DRY_RUN' if DRY_RUN else 'RÉEL'} | solde {await available(s):.4f} SOL\n"
+    if not S["pos"]:
+        txt += "Aucune position"
+    for m, p in S["pos"].items():
+        txt += f"• {p['symbol']}: entrée ${p['entry']:,.0f}, pic ${p['peak']:,.0f}, reste {p['frac'] * 100:.0f}%\n"
+    await u.message.reply_text(txt)
+
+
+@owner_only
+async def cmd_sellall(u, ctx):
+    app, s = ctx.application, ctx.application.bot_data["session"]
+    for m, p in list(S["pos"].items()):
+        try:
+            await sell(app, s, m, 100, "VENTE MANUELLE", await fetch_mc(s, m) or p["entry"])
+        except Exception as e:
+            await u.message.reply_text(f"Échec vente {p['symbol']}: {e}")
+
+
+async def post_init(app):
+    app.bot_data["session"] = aiohttp.ClientSession()
+    asyncio.create_task(scanner(app))
+    asyncio.create_task(monitor(app))
+
+
+def main():
+    app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
+    for name, fn in [("on", cmd_on), ("off", cmd_off), ("status", cmd_status), ("sellall", cmd_sellall)]:
+        app.add_handler(CommandHandler(name, fn))
+    app.run_polling()
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
