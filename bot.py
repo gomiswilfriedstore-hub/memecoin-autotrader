@@ -48,7 +48,9 @@ FILTERS = dict(
     top10_max_pct=14,
     dev_max_pct=14,
     mcap_min_usd=10_000,
-    fees_max_sol=None,   # indisponible via les API publiques (voir explications) -> filtre désactivé
+    mcap_max_usd=100_000,
+    fees_min_sol=0.5,      # frais totaux estimés (voir FEE_RATE) ; None = pas de filtre
+    fees_max_sol=None,
     volume24h_min_usd=40_000,
     buys_min=200,
 )
@@ -67,7 +69,8 @@ CONFIRM_WAIT = 8         # s d'attente après un achat pour que le solde se mett
 SLIPPAGE = 25            # %
 PRIORITY_FEE = 0.001     # SOL
 SCAN_EVERY = 5           # s
-MONITOR_EVERY = 2        # s
+MONITOR_EVERY = 3        # s
+BLIND_SELL_SEC = 90      # pas de prix pendant 90 s -> vente totale de sécurité
 
 S = {"on": False, "pos": {}, "seen": {}, "bought": set(), "sampled": False, "virtual": None, "stats": {}, "stats_ts": time.time()}
 RECHECK_AFTER = 60  # s : un coin refusé est réévalué après 60 s (volume/txs évoluent)
@@ -79,6 +82,7 @@ RECHECK_AFTER = 60  # s : un coin refusé est réévalué après 60 s (volume/tx
 # CANDIDATES_URL et parse_coin() si les noms de champs ne correspondent pas.
 CANDIDATES_URL = ("https://frontend-api-v3.pump.fun/coins"
                   "?offset={off}&limit=50&sort=last_trade_timestamp&order=DESC&includeNsfw=false")
+FEE_RATE = 0.01   # frais pump.fun estimés = 1% du volume (varie selon le market cap : à ajuster)
 PAGES = (0, 50, 100)   # 3 pages = 150 coins par scan
 DEX_URL = "https://api.dexscreener.com/latest/dex/tokens/{mint}"  # volume 24h + nb d'achats
 COIN_URL = "https://frontend-api-v3.pump.fun/coins/{mint}"
@@ -94,9 +98,9 @@ def parse_coin(c: dict) -> dict:
         pool=g("pool_address") or g("pump_swap_pool"),
         age_min=(time.time() * 1000 - g("created_timestamp", 0)) / 60000 if g("created_timestamp") else None,
         mcap=g("usd_market_cap"),
-        volume24h=None,   # rempli par enrich() (DexScreener)
-        buys=None,        # rempli par enrich() (DexScreener)
-        fees_sol=None,    # non disponible
+        volume24h=None,   # rempli par dex_ok() (DexScreener)
+        buys=None,        # rempli par dex_ok() (DexScreener)
+        fees_sol=None,    # estimé par dex_ok()
         symbol=g("symbol"),
     )
 
@@ -113,16 +117,35 @@ async def rpc(s, method, params):
         return (await r.json()).get("result")
 
 
-async def enrich(s, c) -> bool:
-    """Volume 24h et nombre d'achats 24h depuis DexScreener (API publique)."""
-    data = await get_json(s, DEX_URL.format(mint=c["mint"]))
-    pairs = [p for p in (data.get("pairs") or [])
-             if p.get("chainId") == "solana" and (p.get("baseToken") or {}).get("address") == c["mint"]]
-    if not pairs:
-        return False
-    c["volume24h"] = sum((p.get("volume") or {}).get("h24") or 0 for p in pairs)
-    c["buys"] = sum(((p.get("txns") or {}).get("h24") or {}).get("buys") or 0 for p in pairs)
-    return True
+DEX_BATCH = "https://api.dexscreener.com/tokens/v1/solana/{mints}"   # jusqu'à 30 mints par appel
+
+
+async def dex_batch(s, mints):
+    """DexScreener (public) -> {mint: {price, mcap, volume24h, buys}} ; 1 appel pour 30 coins."""
+    out = {}
+    for i in range(0, len(mints), 30):
+        chunk = mints[i:i + 30]
+        async with s.get(DEX_BATCH.format(mints=",".join(chunk)), timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status == 429:
+                raise RuntimeError("DexScreener 429 (trop de requêtes)")
+            r.raise_for_status()
+            data = await r.json()
+        pairs = data if isinstance(data, list) else (data.get("pairs") or [])
+        for p in pairs:
+            m = (p.get("baseToken") or {}).get("address")
+            if m not in chunk or p.get("chainId") != "solana":
+                continue
+            d = out.setdefault(m, dict(price=0.0, mcap=0.0, volume24h=0.0, buys=0, liq=-1))
+            d["volume24h"] += (p.get("volume") or {}).get("h24") or 0
+            d["buys"] += ((p.get("txns") or {}).get("h24") or {}).get("buys") or 0
+            liq = (p.get("liquidity") or {}).get("usd") or 0
+            if liq > d["liq"]:   # prix = celui du pool le plus liquide
+                d["liq"] = liq
+                d["price"] = float(p.get("priceUsd") or 0)
+                pn = float(p.get("priceNative") or 0)
+                d["sol_usd"] = d["price"] / pn if pn else 0   # cours SOL/USD implicite
+                d["mcap"] = p.get("marketCap") or p.get("fdv") or 0
+    return out
 
 
 async def top10_pct(s, coin):
@@ -169,23 +192,41 @@ def reject(why):
     return False
 
 
-async def passes(s, c) -> bool:
+def free_ok(c) -> bool:
+    """Filtres gratuits (données déjà dans la liste pump.fun)."""
     f = FILTERS
-    # 1) filtres gratuits (données déjà dans la liste pump.fun)
     if c["age_min"] is None or c["age_min"] > f["age_max_min"]:
         return reject("age")
-    if not c["mcap"] or c["mcap"] < f["mcap_min_usd"]:
+    if c["mcap"] is None or not (f["mcap_min_usd"] <= c["mcap"] <= f["mcap_max_usd"]):
         return reject("mcap")
-    # 2) DexScreener : volume 24h + achats
-    if not await enrich(s, c):
+    return True
+
+
+def dex_ok(c, d) -> bool:
+    """Filtres DexScreener : volume 24h, achats, prix dispo."""
+    f = FILTERS
+    if not d or not d["price"]:
         return reject("pas_sur_dexscreener")
-    if c["volume24h"] < f["volume24h_min_usd"]:
+    c["price"], c["volume24h"], c["buys"] = d["price"], d["volume24h"], d["buys"]
+    if d["volume24h"] < f["volume24h_min_usd"]:
         return reject("volume")
-    if c["buys"] < f["buys_min"]:
+    if d["buys"] < f["buys_min"]:
         return reject("achats")
-    if f["fees_max_sol"] is not None and (c["fees_sol"] is None or c["fees_sol"] > f["fees_max_sol"]):
-        return reject("frais")
-    # 3) RPC (plus coûteux)
+    fmin, fmax = f["fees_min_sol"], f["fees_max_sol"]
+    if fmin is not None or fmax is not None:
+        sol_usd = d.get("sol_usd") or 0
+        if not sol_usd:
+            return reject("frais")
+        # coin < 24h : volume 24h = volume total ; frais ≈ volume en SOL x FEE_RATE
+        c["fees_sol"] = d["volume24h"] / sol_usd * FEE_RATE
+        if (fmin is not None and c["fees_sol"] < fmin) or (fmax is not None and c["fees_sol"] > fmax):
+            return reject("frais")
+    return True
+
+
+async def onchain_ok(s, c) -> bool:
+    """Filtres RPC (les plus coûteux, donc en dernier)."""
+    f = FILTERS
     t10 = await top10_pct(s, c)
     if t10 is None or t10 > f["top10_max_pct"]:
         return reject("top10")
@@ -194,7 +235,6 @@ async def passes(s, c) -> bool:
         return reject("dev")
     if not await holders_ok(s, c, f["holders_min"]):
         return reject("holders")
-    S["stats"]["OK"] = S["stats"].get("OK", 0) + 1
     return True
 
 
@@ -211,10 +251,6 @@ async def available(s) -> float:
             S["virtual"] = float(os.getenv("DRY_RUN_BALANCE", "1"))
         return S["virtual"]
     return await sol_balance(s)
-
-
-async def fetch_mc(s, mint):
-    return parse_coin(await get_json(s, COIN_URL.format(mint=mint)))["mcap"]
 
 
 async def trade(s, action, mint, amount, in_sol):
@@ -241,6 +277,12 @@ async def notify(app, text):
 
 
 # ----------------------------- BOUCLES --------------------------------
+def throttled_warn(key, msg):
+    if time.time() - S.setdefault("warn", {}).get(key, 0) > 30:
+        S["warn"][key] = time.time()
+        log.warning(msg)
+
+
 async def scanner(app):
     s = app.bot_data["session"]
     while True:
@@ -261,43 +303,52 @@ async def scanner(app):
                 log.info("SAMPLE COIN (brut): %s", coins[0])
                 log.info("SAMPLE COIN (parsé): %s", parse_coin(coins[0]))
                 S["sampled"] = True
+            cands = []
             for raw in coins:
                 c = parse_coin(raw)
                 m = c["mint"]
                 if not m or m in S["bought"] or time.time() - S["seen"].get(m, 0) < RECHECK_AFTER:
                     continue
-                S["seen"][m] = time.time()
-                if not await passes(s, c):
-                    continue
-                size = await available(s) - SOL_RESERVE
-                if size < MIN_BUY_SOL:
+                if free_ok(c):
+                    cands.append(c)
+            cands = list({c["mint"]: c for c in cands}.values())   # dédoublonne (pages qui se chevauchent)
+            if cands:
+                info = await dex_batch(s, [c["mint"] for c in cands])
+                for c in cands:
+                    m = c["mint"]
+                    S["seen"][m] = time.time()
+                    if not dex_ok(c, info.get(m)) or not await onchain_ok(s, c):
+                        continue
+                    S["stats"]["OK"] = S["stats"].get("OK", 0) + 1
+                    size = await available(s) - SOL_RESERVE
+                    if size < MIN_BUY_SOL:
+                        break
+                    size = round(size, 4)
+                    sig = await trade(s, "buy", m, size, True)
+                    if DRY_RUN:
+                        S["virtual"] -= size
+                    S["bought"].add(m)
+                    S["pos"][m] = dict(symbol=c["symbol"], entry=c["price"], peak=c["price"], last=c["price"],
+                                       next_tier=c["price"] * TIER_MULT, cost=size, frac=1.0,
+                                       last_high=time.time(), blind=None)
+                    await notify(app, f"🟢 ACHAT {c['symbol']} ({m})\n{size} SOL @ mcap ${c['mcap']:,.0f}\ntx: {sig}")
+                    await asyncio.sleep(CONFIRM_WAIT)
                     break
-                size = round(size, 4)
-                sig = await trade(s, "buy", m, size, True)
-                if DRY_RUN:
-                    S["virtual"] -= size
-                S["bought"].add(m)
-                S["pos"][m] = dict(symbol=c["symbol"], entry=c["mcap"], peak=c["mcap"],
-                                   next_tier=c["mcap"] * TIER_MULT, cost=size, frac=1.0,
-                                   last_high=time.time())
-                await notify(app, f"🟢 ACHAT {c['symbol']} ({m})\n{size} SOL @ mcap ${c['mcap']:,.0f}\ntx: {sig}")
-                await asyncio.sleep(CONFIRM_WAIT)
-                break
         except Exception as e:
-            log.warning("scanner: %s", e)
+            throttled_warn("scanner", f"scanner: {e}")
         if time.time() - S["stats_ts"] > 60:
             log.info("Bilan 60s (rejets par filtre): %s", S["stats"])
             S["stats"], S["stats_ts"] = {}, time.time()
 
 
-async def sell(app, s, mint, pct, reason, mc):
+async def sell(app, s, mint, pct, reason, price):
     p = S["pos"][mint]
     sig = await trade(s, "sell", mint, f"{pct}%", False)
-    proceeds = p["cost"] * p["frac"] * (pct / 100) * (mc / p["entry"])  # estimation
+    proceeds = p["cost"] * p["frac"] * (pct / 100) * (price / p["entry"])  # estimation
     p["frac"] *= 1 - pct / 100
     if DRY_RUN:
         S["virtual"] += proceeds
-    await notify(app, f"🔴 {reason}: vente {pct}% {p['symbol']} @ ${mc:,.0f} (≈{proceeds:.3f} SOL)\ntx: {sig}")
+    await notify(app, f"🔴 {reason}: vente {pct}% {p['symbol']} à x{price / p['entry']:.2f} (≈{proceeds:.3f} SOL)\ntx: {sig}")
     if pct == 100:
         del S["pos"][mint]
 
@@ -306,24 +357,35 @@ async def monitor(app):
     s = app.bot_data["session"]
     while True:
         await asyncio.sleep(MONITOR_EVERY)
+        if not S["pos"]:
+            continue
+        try:
+            info = await dex_batch(s, list(S["pos"]))
+        except Exception as e:
+            info = {}
+            throttled_warn("monitor", f"monitor: {e}")
+        now = time.time()
         for mint, p in list(S["pos"].items()):
             try:
-                mc = await fetch_mc(s, mint)
-                if not mc:
+                price = (info.get(mint) or {}).get("price")
+                if not price:
+                    p["blind"] = p["blind"] or now
+                    if now - p["blind"] >= BLIND_SELL_SEC:   # plus de prix : on sort par sécurité
+                        await sell(app, s, mint, 100, f"PRIX INDISPONIBLE {BLIND_SELL_SEC}s", p["last"])
                     continue
-                now = time.time()
-                if mc > p["peak"]:
-                    p["peak"], p["last_high"] = mc, now
+                p["blind"], p["last"] = None, price
+                if price > p["peak"]:
+                    p["peak"], p["last_high"] = price, now
                 ref = p["peak"] if STOP_FROM_PEAK else p["entry"]
-                if mc <= ref * (1 - STOP_LOSS):
-                    await sell(app, s, mint, 100, "STOP LOSS", mc)
-                elif mc >= p["next_tier"]:
-                    await sell(app, s, mint, TIER_SELL_PCT, "PALIER +50%", mc)
-                    p["next_tier"] = mc * TIER_MULT  # +50% depuis le prix de cette vente
+                if price <= ref * (1 - STOP_LOSS):
+                    await sell(app, s, mint, 100, "STOP LOSS", price)
+                elif price >= p["next_tier"]:
+                    await sell(app, s, mint, TIER_SELL_PCT, "PALIER +50%", price)
+                    p["next_tier"] = price * TIER_MULT  # +50% depuis le prix de cette vente
                 elif now - p["last_high"] >= STAGNATION_SEC:
-                    await sell(app, s, mint, 100, f"STAGNATION {STAGNATION_SEC // 60} min", mc)
+                    await sell(app, s, mint, 100, f"STAGNATION {STAGNATION_SEC // 60} min", price)
             except Exception as e:
-                log.warning("monitor %s: %s", mint, e)
+                throttled_warn("monitor_" + mint, f"monitor {mint}: {e}")
 
 
 # ----------------------------- TELEGRAM -------------------------------
@@ -353,7 +415,8 @@ async def cmd_status(u, ctx):
     if not S["pos"]:
         txt += "Aucune position"
     for m, p in S["pos"].items():
-        txt += f"• {p['symbol']}: entrée ${p['entry']:,.0f}, pic ${p['peak']:,.0f}, reste {p['frac'] * 100:.0f}%\n"
+        txt += (f"• {p['symbol']}: actuel x{p['last'] / p['entry']:.2f}, pic x{p['peak'] / p['entry']:.2f}, "
+                f"reste {p['frac'] * 100:.0f}%\n")
     await u.message.reply_text(txt)
 
 
@@ -362,7 +425,7 @@ async def cmd_sellall(u, ctx):
     app, s = ctx.application, ctx.application.bot_data["session"]
     for m, p in list(S["pos"].items()):
         try:
-            await sell(app, s, m, 100, "VENTE MANUELLE", await fetch_mc(s, m) or p["entry"])
+            await sell(app, s, m, 100, "VENTE MANUELLE", p["last"])
         except Exception as e:
             await u.message.reply_text(f"Échec vente {p['symbol']}: {e}")
 
