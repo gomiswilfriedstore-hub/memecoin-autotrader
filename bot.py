@@ -70,12 +70,14 @@ SLIPPAGE = 25            # %
 PRIORITY_FEE = 0.001     # SOL
 SCAN_EVERY = 10          # s
 MIN_AGE_MIN = 3          # on n'évalue un coin qu'après 3 min (il faut le temps d'avoir du volume)
-MAX_PER_SCAN = 90        # coins évalués par cycle (3 appels DexScreener max)
+MAX_PER_SCAN = 60        # coins confirmés par DexScreener par cycle (2 appels max)
+STREAM_FRESH = 20        # s : un prix du flux est "frais" s'il a moins de 20 s
+PRESELECT = 0.8          # pré-filtre local : seuils x0.8 (tolérance), DexScreener confirme ensuite
 WS_URL = "wss://pumpportal.fun/api/data"   # flux gratuit des nouveaux tokens
 MONITOR_EVERY = 3        # s
 BLIND_SELL_SEC = 90      # pas de prix pendant 90 s -> vente totale de sécurité
 
-S = {"on": False, "pos": {}, "seen": {}, "bought": set(), "sampled": False, "tracked": {}, "scan_pause": 0, "virtual": None, "stats": {}, "stats_ts": time.time()}
+S = {"on": False, "pos": {}, "seen": {}, "bought": set(), "sampled": False, "tracked": {}, "scan_pause": 0, "sol_usd": 0.0, "sol_ts": 0, "ws": None, "trades_n": 0, "virtual": None, "stats": {}, "stats_ts": time.time()}
 RECHECK_AFTER = 60  # s : un coin refusé est réévalué après 60 s (volume/txs évoluent)
 
 
@@ -151,6 +153,8 @@ async def dex_batch(s, mints):
                 d["sol_usd"] = d["price"] / pn if pn else 0   # cours SOL/USD implicite
                 d["mcap"] = p.get("marketCap") or p.get("fdv") or 0
                 d["pair"] = p.get("pairAddress")
+                if d["sol_usd"] and time.time() - S["sol_ts"] > 300:
+                    S["sol_usd"] = d["sol_usd"]   # repli si Coinbase est indisponible
     return out
 
 
@@ -282,41 +286,69 @@ def throttled_warn(key, msg):
         log.warning(msg)
 
 
+async def refresh_sol_usd(s):
+    """Cours SOL/USD (Coinbase, public). Repli : cours implicite de DexScreener."""
+    if time.time() - S["sol_ts"] < 60:
+        return
+    try:
+        data = await get_json(s, "https://api.coinbase.com/v2/prices/SOL-USD/spot")
+        S["sol_usd"], S["sol_ts"] = float(data["data"]["amount"]), time.time()
+    except Exception as e:
+        throttled_warn("sol", f"cours SOL/USD: {e}")
+
+
+def local_ok(t) -> bool:
+    """Pré-filtre gratuit à partir du flux de trades : évite d'appeler DexScreener pour rien."""
+    f, sol = FILTERS, S["sol_usd"]
+    mc = t["mcap_sol"] * sol
+    return (t["buys"] >= f["buys_min"] * PRESELECT
+            and t["vol_sol"] * sol >= f["volume24h_min_usd"] * PRESELECT
+            and f["mcap_min_usd"] * PRESELECT <= mc <= f["mcap_max_usd"] / PRESELECT)
+
+
+async def ws_subscribe(ws, mints):
+    for i in range(0, len(mints), 50):
+        await ws.send_json({"method": "subscribeTokenTrade", "keys": mints[i:i + 50]})
+
+
 async def new_token_feed(app):
-    """Écoute tous les nouveaux tokens pump.fun (PumpPortal) et les garde en mémoire 65 min."""
+    """Flux PumpPortal : nouveaux tokens + leurs trades (volume, achats, market cap) en temps réel."""
     s = app.bot_data["session"]
     while True:
         try:
             async with s.ws_connect(WS_URL, heartbeat=30) as ws:
+                S["ws"] = ws
                 await ws.send_json({"method": "subscribeNewToken"})
+                if S["tracked"]:
+                    await ws_subscribe(ws, list(S["tracked"]))   # après une reconnexion
                 log.info("Flux nouveaux tokens connecté")
                 async for msg in ws:
                     if msg.type != aiohttp.WSMsgType.TEXT:
                         continue
                     d = json.loads(msg.data)
-                    if d.get("txType") != "create" or not d.get("mint"):
+                    m, tx = d.get("mint"), d.get("txType")
+                    if not m:
                         continue
-                    S["tracked"][d["mint"]] = dict(created=time.time(), creator=d.get("traderPublicKey"),
-                                                   bonding_curve=d.get("bondingCurveKey"),
-                                                   symbol=d.get("symbol") or "?", pool=None, wait=RECHECK_AFTER)
+                    sol = d.get("solAmount") or 0
+                    if tx == "create":
+                        S["tracked"][m] = dict(created=time.time(), creator=d.get("traderPublicKey"),
+                                               bonding_curve=d.get("bondingCurveKey"),
+                                               symbol=d.get("symbol") or "?", pool=None, wait=RECHECK_AFTER,
+                                               buys=1 if sol else 0, sells=0, vol_sol=float(sol),
+                                               mcap_sol=float(d.get("marketCapSol") or 0), last_trade=time.time())
+                        await ws_subscribe(ws, [m])
+                    elif tx in ("buy", "sell") and m in S["tracked"]:
+                        t = S["tracked"][m]
+                        t["buys" if tx == "buy" else "sells"] += 1
+                        t["vol_sol"] += float(sol)
+                        if d.get("marketCapSol"):
+                            t["mcap_sol"] = float(d["marketCapSol"])
+                        t["last_trade"] = time.time()
+                        S["trades_n"] += 1
         except Exception as e:
             throttled_warn("ws", f"flux tokens: {e}")
+        S["ws"] = None
         await asyncio.sleep(5)
-
-
-async def seed_tracked(app):
-    """Au démarrage : récupère les ~150 coins les plus récents pour ne pas partir de zéro."""
-    s = app.bot_data["session"]
-    try:
-        for off in PAGES:
-            for c in await get_json(s, CANDIDATES_URL.format(off=off)):
-                p = parse_coin(c)
-                if p["mint"] and p["age_min"] is not None and p["age_min"] <= FILTERS["age_max_min"]:
-                    S["tracked"].setdefault(p["mint"], dict(
-                        created=time.time() - p["age_min"] * 60, creator=p["creator"],
-                        bonding_curve=p["bonding_curve"], symbol=p["symbol"], pool=p["pool"], wait=RECHECK_AFTER))
-    except Exception as e:
-        log.warning("seed: %s", e)
 
 
 async def scanner(app):
@@ -326,6 +358,7 @@ async def scanner(app):
         if not S["on"]:
             continue
         try:
+            await refresh_sol_usd(s)
             bal = await available(s)
             if bal - SOL_RESERVE < MIN_BUY_SOL:
                 if time.time() - S.get("lowlog", 0) > 300:
@@ -333,21 +366,30 @@ async def scanner(app):
                     S["lowlog"] = time.time()
                 continue  # on attend qu'une vente en libère
             now = time.time()
-            if now < S["scan_pause"]:
+            if now < S["scan_pause"] or not S["sol_usd"]:
                 continue
-            for m in [m for m, t in S["tracked"].items() if now - t["created"] > (FILTERS["age_max_min"] + 5) * 60]:
+            old = [m for m, t in S["tracked"].items()
+                   if now - t["created"] > (FILTERS["age_max_min"] + 5) * 60 and m not in S["pos"]]
+            for m in old:
                 del S["tracked"][m]   # trop vieux : on arrête de le suivre
+            if old and S["ws"] is not None:
+                try:
+                    await S["ws"].send_json({"method": "unsubscribeTokenTrade", "keys": old[:50]})
+                except Exception:
+                    pass
             due = []
             for m, t in S["tracked"].items():
                 age = (now - t["created"]) / 60
                 if MIN_AGE_MIN <= age <= FILTERS["age_max_min"] and m not in S["bought"] \
-                        and now - S["seen"].get(m, 0) >= t["wait"]:
+                        and now - S["seen"].get(m, 0) >= t["wait"] and local_ok(t):
                     due.append((S["seen"].get(m, 0), m, age))
             due.sort()
-            cands = [dict(mint=m, creator=S["tracked"][m]["creator"], bonding_curve=S["tracked"][m]["bonding_curve"],
-                          curve_ata=None, pool=S["tracked"][m]["pool"], age_min=age, mcap=None, volume24h=None,
-                          buys=None, fees_sol=None, symbol=S["tracked"][m]["symbol"])
-                     for _, m, age in due[:MAX_PER_SCAN]]
+            cands = []
+            for _, m, age in due[:MAX_PER_SCAN]:
+                t = S["tracked"][m]
+                cands.append(dict(mint=m, creator=t["creator"], bonding_curve=t["bonding_curve"], curve_ata=None,
+                                  pool=t["pool"], age_min=age, mcap=None, volume24h=None, buys=None,
+                                  fees_sol=None, symbol=t["symbol"]))
             S["stats"]["évalués"] = S["stats"].get("évalués", 0) + len(cands)
             if cands:
                 info = await dex_batch(s, [c["mint"] for c in cands])
@@ -355,21 +397,21 @@ async def scanner(app):
                     m = c["mint"]
                     S["seen"][m] = time.time()
                     d = info.get(m)
-                    # coin sans volume : on le revérifie moins souvent (économise les appels)
-                    S["tracked"][m]["wait"] = 180 if (not d or d["volume24h"] < 10_000) else RECHECK_AFTER
+                    S["tracked"][m]["wait"] = 180 if not d else RECHECK_AFTER
                     if not dex_ok(c, d) or not await onchain_ok(s, c):
                         continue
                     S["stats"]["OK"] = S["stats"].get("OK", 0) + 1
+                    metric = S["tracked"][m]["mcap_sol"] or (c["mcap"] / S["sol_usd"])
                     size = await available(s) - SOL_RESERVE
-                    if size < MIN_BUY_SOL:
+                    if size < MIN_BUY_SOL or not metric:
                         break
                     size = round(size, 4)
                     sig = await trade(s, "buy", m, size, True)
                     if DRY_RUN:
                         S["virtual"] -= size
                     S["bought"].add(m)
-                    S["pos"][m] = dict(symbol=c["symbol"], entry=c["price"], peak=c["price"], last=c["price"],
-                                       next_tier=c["price"] * TIER_MULT, cost=size, frac=1.0,
+                    S["pos"][m] = dict(symbol=c["symbol"], entry=metric, peak=metric, last=metric,
+                                       next_tier=metric * TIER_MULT, cost=size, frac=1.0,
                                        last_high=time.time(), blind=None)
                     await notify(app, f"🟢 ACHAT {c['symbol']} ({m})\n{size} SOL @ mcap ${c['mcap']:,.0f}\ntx: {sig}")
                     await asyncio.sleep(CONFIRM_WAIT)
@@ -377,8 +419,9 @@ async def scanner(app):
         except Exception as e:
             throttled_warn("scanner", f"scanner: {e}")
         if time.time() - S["stats_ts"] > 60:
-            log.info("Bilan 60s | coins suivis: %d | rejets par filtre: %s", len(S["tracked"]), S["stats"])
-            S["stats"], S["stats_ts"] = {}, time.time()
+            log.info("Bilan 60s | suivis: %d | trades reçus: %d | SOL=$%.0f | rejets: %s",
+                     len(S["tracked"]), S["trades_n"], S["sol_usd"], S["stats"])
+            S["stats"], S["stats_ts"], S["trades_n"] = {}, time.time(), 0
 
 
 async def sell(app, s, mint, pct, reason, price):
@@ -399,15 +442,28 @@ async def monitor(app):
         await asyncio.sleep(MONITOR_EVERY)
         if not S["pos"]:
             continue
-        try:
-            info = await dex_batch(s, list(S["pos"]))
-        except Exception as e:
-            info = {}
-            throttled_warn("monitor", f"monitor: {e}")
-        now = time.time()
+        now, sol = time.time(), S["sol_usd"]
+        prices, stale = {}, []
+        for m in S["pos"]:
+            t = S["tracked"].get(m)
+            if t and t["mcap_sol"] and now - t["last_trade"] < STREAM_FRESH:
+                prices[m] = t["mcap_sol"]          # prix frais du flux (market cap en SOL)
+            else:
+                stale.append(m)
+        if stale and sol:                           # coin silencieux ou migré : on interroge DexScreener
+            try:
+                for m, d in (await dex_batch(s, stale)).items():
+                    if d["mcap"]:
+                        prices[m] = d["mcap"] / sol
+            except Exception as e:
+                throttled_warn("monitor", f"monitor: {e}")
+        for m in stale:                             # repli : dernier prix connu du flux (< 2 min)
+            t = S["tracked"].get(m)
+            if m not in prices and t and t["mcap_sol"] and now - t["last_trade"] < 120:
+                prices[m] = t["mcap_sol"]
         for mint, p in list(S["pos"].items()):
             try:
-                price = (info.get(mint) or {}).get("price")
+                price = prices.get(mint)
                 if not price:
                     p["blind"] = p["blind"] or now
                     if now - p["blind"] >= BLIND_SELL_SEC:   # plus de prix : on sort par sécurité
@@ -482,7 +538,6 @@ async def start_health():
 async def post_init(app):
     await start_health()
     app.bot_data["session"] = aiohttp.ClientSession()
-    asyncio.create_task(seed_tracked(app))
     asyncio.create_task(new_token_feed(app))
     asyncio.create_task(scanner(app))
     asyncio.create_task(monitor(app))
