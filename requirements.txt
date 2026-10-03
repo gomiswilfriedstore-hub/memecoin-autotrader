@@ -1,11 +1,5 @@
-python-telegram-bot>=20.0
-requests
-websockets
-solders
-solana
+python-telegram-bot==21.6
 aiohttp
-base58
 solders
-solana
-python-telegram-bot
-requests
+base58
+python-dotenv
