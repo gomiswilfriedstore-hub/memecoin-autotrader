@@ -18,6 +18,7 @@ import time
 
 import aiohttp
 import base58
+from aiohttp import web
 from dotenv import load_dotenv
 from solders.commitment_config import CommitmentLevel
 from solders.keypair import Keypair
@@ -29,6 +30,8 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+logging.getLogger("httpx").setLevel(logging.WARNING)  # évite d'écrire le token Telegram dans les logs
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("pumpbot")
 
 # ----------------------------- CONFIG ---------------------------------
@@ -317,7 +320,17 @@ async def cmd_sellall(u, ctx):
             await u.message.reply_text(f"Échec vente {p['symbol']}: {e}")
 
 
+async def start_health():
+    """Mini serveur HTTP : Render (Web Service) exige un port ouvert, et sert aussi au ping anti-veille."""
+    srv = web.Application()
+    srv.router.add_get("/", lambda r: web.Response(text="ok"))
+    runner = web.AppRunner(srv)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", "10000"))).start()
+
+
 async def post_init(app):
+    await start_health()
     app.bot_data["session"] = aiohttp.ClientSession()
     asyncio.create_task(scanner(app))
     asyncio.create_task(monitor(app))
