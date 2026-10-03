@@ -1,8 +1,8 @@
 """
 Bot Telegram - pump.fun "Top movers" auto-trader
 Filtres = ceux des captures d'écran (Audit 4 + Métriques 4 = 8 filtres).
-Achat : tout le solde SOL dispo (moins une réserve de frais). Le scan continue
-        tant qu'il reste assez de SOL : plusieurs positions peuvent coexister.
+Achat : 30% du solde SOL dispo (hors réserve de frais) à chaque achat. Le scan
+        continue tant qu'il reste assez de SOL : plusieurs positions coexistent.
 Sortie : vend 80% du restant à chaque palier de +50% (calculé depuis le prix de
          la dernière vente), stop loss -25%, et vente totale si aucun nouveau
          plus haut pendant 3 min (stagnation).
@@ -51,7 +51,7 @@ FILTERS = dict(
     mcap_max_usd=100_000,
     fees_min_sol=0.5,      # frais totaux estimés (voir FEE_RATE) ; None = pas de filtre
     fees_max_sol=None,
-    volume24h_min_usd=40_000,
+    volume24h_min_usd=15_000,
     buys_min=200,
 )
 
@@ -63,7 +63,8 @@ STOP_FROM_PEAK = True    # True = trailing (depuis le plus haut) / False = depui
 
 # Exécution
 SOL_RESERVE = 0.02       # SOL gardés pour frais/rent (ne pas mettre 0)
-MIN_BUY_SOL = 0.05       # en dessous, le bot n'achète pas (mais continue de scanner)
+BUY_FRACTION = 0.30      # chaque achat utilise 30% des fonds disponibles (hors réserve)
+MIN_BUY_SOL = 0.02       # taille d'achat minimale ; en dessous, le bot n'achète pas (mais continue de scanner)
 STAGNATION_SEC = 180     # pas de nouveau plus haut pendant 3 min -> vente totale
 CONFIRM_WAIT = 8         # s d'attente après un achat pour que le solde se mette à jour
 SLIPPAGE = 25            # %
@@ -360,9 +361,9 @@ async def scanner(app):
         try:
             await refresh_sol_usd(s)
             bal = await available(s)
-            if bal - SOL_RESERVE < MIN_BUY_SOL:
+            if (bal - SOL_RESERVE) * BUY_FRACTION < MIN_BUY_SOL:
                 if time.time() - S.get("lowlog", 0) > 300:
-                    log.info("Solde insuffisant (%.4f SOL, il faut > %.2f) : scan en pause", bal, SOL_RESERVE + MIN_BUY_SOL)
+                    log.info("Solde insuffisant (%.4f SOL, il faut > %.2f) : scan en pause", bal, SOL_RESERVE + MIN_BUY_SOL / BUY_FRACTION)
                     S["lowlog"] = time.time()
                 continue  # on attend qu'une vente en libère
             now = time.time()
@@ -402,7 +403,7 @@ async def scanner(app):
                         continue
                     S["stats"]["OK"] = S["stats"].get("OK", 0) + 1
                     metric = S["tracked"][m]["mcap_sol"] or (c["mcap"] / S["sol_usd"])
-                    size = await available(s) - SOL_RESERVE
+                    size = (await available(s) - SOL_RESERVE) * BUY_FRACTION
                     if size < MIN_BUY_SOL or not metric:
                         break
                     size = round(size, 4)
