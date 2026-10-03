@@ -49,8 +49,6 @@ FILTERS = dict(
     dev_max_pct=14,
     mcap_min_usd=10_000,
     mcap_max_usd=100_000,
-    fees_min_sol=0.5,      # frais totaux estimés (voir FEE_RATE) ; None = pas de filtre
-    fees_max_sol=None,
     volume24h_min_usd=15_000,
     buys_min=200,
 )
@@ -90,7 +88,6 @@ RECHECK_AFTER = 60  # s : un coin refusé est réévalué après 60 s (volume/tx
 # CANDIDATES_URL et parse_coin() si les noms de champs ne correspondent pas.
 CANDIDATES_URL = ("https://frontend-api-v3.pump.fun/coins"
                   "?offset={off}&limit=50&sort=created_timestamp&order=DESC&includeNsfw=false")
-FEE_RATE = 0.01   # frais pump.fun estimés = 1% du volume (varie selon le market cap : à ajuster)
 PAGES = (0, 50, 100)   # utilisé une seule fois au démarrage (150 coins les plus récents)
 DEX_URL = "https://api.dexscreener.com/latest/dex/tokens/{mint}"  # volume 24h + nb d'achats
 COIN_URL = "https://frontend-api-v3.pump.fun/coins/{mint}"
@@ -108,7 +105,7 @@ def parse_coin(c: dict) -> dict:
         mcap=g("usd_market_cap"),
         volume24h=None,   # rempli par dex_ok() (DexScreener)
         buys=None,        # rempli par dex_ok() (DexScreener)
-        fees_sol=None,    # estimé par dex_ok()
+        fees_sol=None,    # non utilisé
         symbol=g("symbol"),
     )
 
@@ -206,7 +203,7 @@ def reject(why):
 
 
 def dex_ok(c, d) -> bool:
-    """Filtres DexScreener : market cap, volume 24h, achats, frais estimés."""
+    """Filtres DexScreener : market cap, volume 24h, achats."""
     f = FILTERS
     if not d or not d["price"]:
         return reject("pas_sur_dexscreener")
@@ -218,15 +215,6 @@ def dex_ok(c, d) -> bool:
         return reject("volume")
     if d["buys"] < f["buys_min"]:
         return reject("achats")
-    fmin, fmax = f["fees_min_sol"], f["fees_max_sol"]
-    if fmin is not None or fmax is not None:
-        sol_usd = d.get("sol_usd") or 0
-        if not sol_usd:
-            return reject("frais")
-        # coin < 24h : volume 24h = volume total ; frais ≈ volume en SOL x FEE_RATE
-        c["fees_sol"] = d["volume24h"] / sol_usd * FEE_RATE
-        if (fmin is not None and c["fees_sol"] < fmin) or (fmax is not None and c["fees_sol"] > fmax):
-            return reject("frais")
     return True
 
 
