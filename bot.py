@@ -11,7 +11,7 @@ Commandes Telegram : /on /off /status /sellall
 Lance d'abord en DRY_RUN=true pour vérifier que tout fonctionne.
 """
 import asyncio
-import base64
+import json
 import logging
 import os
 import time
@@ -68,11 +68,14 @@ STAGNATION_SEC = 180     # pas de nouveau plus haut pendant 3 min -> vente total
 CONFIRM_WAIT = 8         # s d'attente après un achat pour que le solde se mette à jour
 SLIPPAGE = 25            # %
 PRIORITY_FEE = 0.001     # SOL
-SCAN_EVERY = 5           # s
+SCAN_EVERY = 10          # s
+MIN_AGE_MIN = 3          # on n'évalue un coin qu'après 3 min (il faut le temps d'avoir du volume)
+MAX_PER_SCAN = 90        # coins évalués par cycle (3 appels DexScreener max)
+WS_URL = "wss://pumpportal.fun/api/data"   # flux gratuit des nouveaux tokens
 MONITOR_EVERY = 3        # s
 BLIND_SELL_SEC = 90      # pas de prix pendant 90 s -> vente totale de sécurité
 
-S = {"on": False, "pos": {}, "seen": {}, "bought": set(), "sampled": False, "virtual": None, "stats": {}, "stats_ts": time.time()}
+S = {"on": False, "pos": {}, "seen": {}, "bought": set(), "sampled": False, "tracked": {}, "scan_pause": 0, "virtual": None, "stats": {}, "stats_ts": time.time()}
 RECHECK_AFTER = 60  # s : un coin refusé est réévalué après 60 s (volume/txs évoluent)
 
 
@@ -81,9 +84,9 @@ RECHECK_AFTER = 60  # s : un coin refusé est réévalué après 60 s (volume/tx
 # utilise l'API frontend de pump.fun (non officielle, peut changer) : adapte
 # CANDIDATES_URL et parse_coin() si les noms de champs ne correspondent pas.
 CANDIDATES_URL = ("https://frontend-api-v3.pump.fun/coins"
-                  "?offset={off}&limit=50&sort=last_trade_timestamp&order=DESC&includeNsfw=false")
+                  "?offset={off}&limit=50&sort=created_timestamp&order=DESC&includeNsfw=false")
 FEE_RATE = 0.01   # frais pump.fun estimés = 1% du volume (varie selon le market cap : à ajuster)
-PAGES = (0, 50, 100)   # 3 pages = 150 coins par scan
+PAGES = (0, 50, 100)   # utilisé une seule fois au démarrage (150 coins les plus récents)
 DEX_URL = "https://api.dexscreener.com/latest/dex/tokens/{mint}"  # volume 24h + nb d'achats
 COIN_URL = "https://frontend-api-v3.pump.fun/coins/{mint}"
 
@@ -127,9 +130,11 @@ async def dex_batch(s, mints):
         chunk = mints[i:i + 30]
         async with s.get(DEX_BATCH.format(mints=",".join(chunk)), timeout=aiohttp.ClientTimeout(total=10)) as r:
             if r.status == 429:
-                raise RuntimeError("DexScreener 429 (trop de requêtes)")
+                S["scan_pause"] = time.time() + 30   # le scanner fait une pause de 30 s
+                raise RuntimeError("DexScreener 429 (trop de requêtes) : pause 30 s")
             r.raise_for_status()
             data = await r.json()
+        await asyncio.sleep(0.3)
         pairs = data if isinstance(data, list) else (data.get("pairs") or [])
         for p in pairs:
             m = (p.get("baseToken") or {}).get("address")
@@ -145,6 +150,7 @@ async def dex_batch(s, mints):
                 pn = float(p.get("priceNative") or 0)
                 d["sol_usd"] = d["price"] / pn if pn else 0   # cours SOL/USD implicite
                 d["mcap"] = p.get("marketCap") or p.get("fdv") or 0
+                d["pair"] = p.get("pairAddress")
     return out
 
 
@@ -192,22 +198,15 @@ def reject(why):
     return False
 
 
-def free_ok(c) -> bool:
-    """Filtres gratuits (données déjà dans la liste pump.fun)."""
-    f = FILTERS
-    if c["age_min"] is None or c["age_min"] > f["age_max_min"]:
-        return reject("age")
-    if c["mcap"] is None or not (f["mcap_min_usd"] <= c["mcap"] <= f["mcap_max_usd"]):
-        return reject("mcap")
-    return True
-
-
 def dex_ok(c, d) -> bool:
-    """Filtres DexScreener : volume 24h, achats, prix dispo."""
+    """Filtres DexScreener : market cap, volume 24h, achats, frais estimés."""
     f = FILTERS
     if not d or not d["price"]:
         return reject("pas_sur_dexscreener")
     c["price"], c["volume24h"], c["buys"] = d["price"], d["volume24h"], d["buys"]
+    c["mcap"], c["pool"] = d["mcap"], d.get("pair")
+    if not (f["mcap_min_usd"] <= c["mcap"] <= f["mcap_max_usd"]):
+        return reject("mcap")
     if d["volume24h"] < f["volume24h_min_usd"]:
         return reject("volume")
     if d["buys"] < f["buys_min"]:
@@ -283,6 +282,43 @@ def throttled_warn(key, msg):
         log.warning(msg)
 
 
+async def new_token_feed(app):
+    """Écoute tous les nouveaux tokens pump.fun (PumpPortal) et les garde en mémoire 65 min."""
+    s = app.bot_data["session"]
+    while True:
+        try:
+            async with s.ws_connect(WS_URL, heartbeat=30) as ws:
+                await ws.send_json({"method": "subscribeNewToken"})
+                log.info("Flux nouveaux tokens connecté")
+                async for msg in ws:
+                    if msg.type != aiohttp.WSMsgType.TEXT:
+                        continue
+                    d = json.loads(msg.data)
+                    if d.get("txType") != "create" or not d.get("mint"):
+                        continue
+                    S["tracked"][d["mint"]] = dict(created=time.time(), creator=d.get("traderPublicKey"),
+                                                   bonding_curve=d.get("bondingCurveKey"),
+                                                   symbol=d.get("symbol") or "?", pool=None, wait=RECHECK_AFTER)
+        except Exception as e:
+            throttled_warn("ws", f"flux tokens: {e}")
+        await asyncio.sleep(5)
+
+
+async def seed_tracked(app):
+    """Au démarrage : récupère les ~150 coins les plus récents pour ne pas partir de zéro."""
+    s = app.bot_data["session"]
+    try:
+        for off in PAGES:
+            for c in await get_json(s, CANDIDATES_URL.format(off=off)):
+                p = parse_coin(c)
+                if p["mint"] and p["age_min"] is not None and p["age_min"] <= FILTERS["age_max_min"]:
+                    S["tracked"].setdefault(p["mint"], dict(
+                        created=time.time() - p["age_min"] * 60, creator=p["creator"],
+                        bonding_curve=p["bonding_curve"], symbol=p["symbol"], pool=p["pool"], wait=RECHECK_AFTER))
+    except Exception as e:
+        log.warning("seed: %s", e)
+
+
 async def scanner(app):
     s = app.bot_data["session"]
     while True:
@@ -296,28 +332,32 @@ async def scanner(app):
                     log.info("Solde insuffisant (%.4f SOL, il faut > %.2f) : scan en pause", bal, SOL_RESERVE + MIN_BUY_SOL)
                     S["lowlog"] = time.time()
                 continue  # on attend qu'une vente en libère
-            coins = []
-            for off in PAGES:
-                coins += await get_json(s, CANDIDATES_URL.format(off=off))
-            if coins and not S["sampled"]:
-                log.info("SAMPLE COIN (brut): %s", coins[0])
-                log.info("SAMPLE COIN (parsé): %s", parse_coin(coins[0]))
-                S["sampled"] = True
-            cands = []
-            for raw in coins:
-                c = parse_coin(raw)
-                m = c["mint"]
-                if not m or m in S["bought"] or time.time() - S["seen"].get(m, 0) < RECHECK_AFTER:
-                    continue
-                if free_ok(c):
-                    cands.append(c)
-            cands = list({c["mint"]: c for c in cands}.values())   # dédoublonne (pages qui se chevauchent)
+            now = time.time()
+            if now < S["scan_pause"]:
+                continue
+            for m in [m for m, t in S["tracked"].items() if now - t["created"] > (FILTERS["age_max_min"] + 5) * 60]:
+                del S["tracked"][m]   # trop vieux : on arrête de le suivre
+            due = []
+            for m, t in S["tracked"].items():
+                age = (now - t["created"]) / 60
+                if MIN_AGE_MIN <= age <= FILTERS["age_max_min"] and m not in S["bought"] \
+                        and now - S["seen"].get(m, 0) >= t["wait"]:
+                    due.append((S["seen"].get(m, 0), m, age))
+            due.sort()
+            cands = [dict(mint=m, creator=S["tracked"][m]["creator"], bonding_curve=S["tracked"][m]["bonding_curve"],
+                          curve_ata=None, pool=S["tracked"][m]["pool"], age_min=age, mcap=None, volume24h=None,
+                          buys=None, fees_sol=None, symbol=S["tracked"][m]["symbol"])
+                     for _, m, age in due[:MAX_PER_SCAN]]
+            S["stats"]["évalués"] = S["stats"].get("évalués", 0) + len(cands)
             if cands:
                 info = await dex_batch(s, [c["mint"] for c in cands])
                 for c in cands:
                     m = c["mint"]
                     S["seen"][m] = time.time()
-                    if not dex_ok(c, info.get(m)) or not await onchain_ok(s, c):
+                    d = info.get(m)
+                    # coin sans volume : on le revérifie moins souvent (économise les appels)
+                    S["tracked"][m]["wait"] = 180 if (not d or d["volume24h"] < 10_000) else RECHECK_AFTER
+                    if not dex_ok(c, d) or not await onchain_ok(s, c):
                         continue
                     S["stats"]["OK"] = S["stats"].get("OK", 0) + 1
                     size = await available(s) - SOL_RESERVE
@@ -337,7 +377,7 @@ async def scanner(app):
         except Exception as e:
             throttled_warn("scanner", f"scanner: {e}")
         if time.time() - S["stats_ts"] > 60:
-            log.info("Bilan 60s (rejets par filtre): %s", S["stats"])
+            log.info("Bilan 60s | coins suivis: %d | rejets par filtre: %s", len(S["tracked"]), S["stats"])
             S["stats"], S["stats_ts"] = {}, time.time()
 
 
@@ -442,6 +482,8 @@ async def start_health():
 async def post_init(app):
     await start_health()
     app.bot_data["session"] = aiohttp.ClientSession()
+    asyncio.create_task(seed_tracked(app))
+    asyncio.create_task(new_token_feed(app))
     asyncio.create_task(scanner(app))
     asyncio.create_task(monitor(app))
 
