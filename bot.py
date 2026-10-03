@@ -48,7 +48,7 @@ FILTERS = dict(
     top10_max_pct=14,
     dev_max_pct=14,
     mcap_min_usd=10_000,
-    fees_max_sol=0.5,
+    fees_max_sol=None,   # indisponible via les API publiques (voir explications) -> filtre désactivé
     volume24h_min_usd=40_000,
     buys_min=200,
 )
@@ -69,7 +69,7 @@ PRIORITY_FEE = 0.001     # SOL
 SCAN_EVERY = 5           # s
 MONITOR_EVERY = 2        # s
 
-S = {"on": False, "pos": {}, "seen": {}, "bought": set(), "sampled": False, "virtual": None}
+S = {"on": False, "pos": {}, "seen": {}, "bought": set(), "sampled": False, "virtual": None, "stats": {}, "stats_ts": time.time()}
 RECHECK_AFTER = 60  # s : un coin refusé est réévalué après 60 s (volume/txs évoluent)
 
 
@@ -78,7 +78,9 @@ RECHECK_AFTER = 60  # s : un coin refusé est réévalué après 60 s (volume/tx
 # utilise l'API frontend de pump.fun (non officielle, peut changer) : adapte
 # CANDIDATES_URL et parse_coin() si les noms de champs ne correspondent pas.
 CANDIDATES_URL = ("https://frontend-api-v3.pump.fun/coins"
-                  "?offset=0&limit=50&sort=last_trade_timestamp&order=DESC&includeNsfw=false")
+                  "?offset={off}&limit=50&sort=last_trade_timestamp&order=DESC&includeNsfw=false")
+PAGES = (0, 50, 100)   # 3 pages = 150 coins par scan
+DEX_URL = "https://api.dexscreener.com/latest/dex/tokens/{mint}"  # volume 24h + nb d'achats
 COIN_URL = "https://frontend-api-v3.pump.fun/coins/{mint}"
 
 
@@ -88,11 +90,13 @@ def parse_coin(c: dict) -> dict:
         mint=g("mint"),
         creator=g("creator"),
         curve_ata=g("associated_bonding_curve"),
+        bonding_curve=g("bonding_curve"),
+        pool=g("pool_address") or g("pump_swap_pool"),
         age_min=(time.time() * 1000 - g("created_timestamp", 0)) / 60000 if g("created_timestamp") else None,
         mcap=g("usd_market_cap"),
-        volume24h=g("volume_24h") or g("volume"),     # à vérifier
-        buys=g("buy_count") or g("buys"),             # à vérifier
-        fees_sol=g("total_fees_sol") or g("fees"),    # à vérifier
+        volume24h=None,   # rempli par enrich() (DexScreener)
+        buys=None,        # rempli par enrich() (DexScreener)
+        fees_sol=None,    # non disponible
         symbol=g("symbol"),
     )
 
@@ -109,12 +113,37 @@ async def rpc(s, method, params):
         return (await r.json()).get("result")
 
 
+async def enrich(s, c) -> bool:
+    """Volume 24h et nombre d'achats 24h depuis DexScreener (API publique)."""
+    data = await get_json(s, DEX_URL.format(mint=c["mint"]))
+    pairs = [p for p in (data.get("pairs") or [])
+             if p.get("chainId") == "solana" and (p.get("baseToken") or {}).get("address") == c["mint"]]
+    if not pairs:
+        return False
+    c["volume24h"] = sum((p.get("volume") or {}).get("h24") or 0 for p in pairs)
+    c["buys"] = sum(((p.get("txns") or {}).get("h24") or {}).get("buys") or 0 for p in pairs)
+    return True
+
+
 async def top10_pct(s, coin):
+    """% détenu par les 10 plus gros holders, hors bonding curve / pool de liquidité."""
     res = await rpc(s, "getTokenLargestAccounts", [coin["mint"]])
     if not res:
         return None
-    accs = [a for a in res["value"] if a["address"] != coin["curve_ata"]]  # exclut la bonding curve
-    return sum(float(a["uiAmount"] or 0) for a in accs[:10]) / 1e9 * 100   # supply pump.fun = 1B
+    accs = res["value"]
+    info = await rpc(s, "getMultipleAccounts", [[a["address"] for a in accs], {"encoding": "jsonParsed"}])
+    owners = (info or {}).get("value") or [None] * len(accs)
+    skip = {coin["bonding_curve"], coin["pool"]} - {None}
+    kept = []
+    for a, acc in zip(accs, owners):
+        try:
+            owner = acc["data"]["parsed"]["info"]["owner"]
+        except Exception:
+            owner = None
+        if a["address"] == coin["curve_ata"] or owner in skip:
+            continue
+        kept.append(float(a["uiAmount"] or 0))
+    return sum(kept[:10]) / 1e9 * 100   # supply pump.fun = 1B
 
 
 async def dev_pct(s, coin):
@@ -135,28 +164,38 @@ async def holders_ok(s, coin, minimum):
     return sum(1 for a in res["token_accounts"] if int(a.get("amount", 0)) > 0) >= minimum
 
 
+def reject(why):
+    S["stats"][why] = S["stats"].get(why, 0) + 1
+    return False
+
+
 async def passes(s, c) -> bool:
     f = FILTERS
-    # filtres rapides d'abord (fail closed : donnée absente = rejet)
-    quick = [
-        (c["age_min"], lambda v: v <= f["age_max_min"]),
-        (c["mcap"], lambda v: v >= f["mcap_min_usd"]),
-        (c["volume24h"], lambda v: v >= f["volume24h_min_usd"]),
-        (c["buys"], lambda v: v >= f["buys_min"]),
-        (c["fees_sol"], lambda v: v <= f["fees_max_sol"]),
-    ]
-    for val, ok in quick:
-        if val is None or not ok(val):
-            return False
-    # filtres coûteux (appels RPC)
+    # 1) filtres gratuits (données déjà dans la liste pump.fun)
+    if c["age_min"] is None or c["age_min"] > f["age_max_min"]:
+        return reject("age")
+    if not c["mcap"] or c["mcap"] < f["mcap_min_usd"]:
+        return reject("mcap")
+    # 2) DexScreener : volume 24h + achats
+    if not await enrich(s, c):
+        return reject("pas_sur_dexscreener")
+    if c["volume24h"] < f["volume24h_min_usd"]:
+        return reject("volume")
+    if c["buys"] < f["buys_min"]:
+        return reject("achats")
+    if f["fees_max_sol"] is not None and (c["fees_sol"] is None or c["fees_sol"] > f["fees_max_sol"]):
+        return reject("frais")
+    # 3) RPC (plus coûteux)
     t10 = await top10_pct(s, c)
     if t10 is None or t10 > f["top10_max_pct"]:
-        return False
+        return reject("top10")
     dv = await dev_pct(s, c)
     if dv is None or dv > f["dev_max_pct"]:
-        return False
-    h = await holders_ok(s, c, f["holders_min"])
-    return bool(h)
+        return reject("dev")
+    if not await holders_ok(s, c, f["holders_min"]):
+        return reject("holders")
+    S["stats"]["OK"] = S["stats"].get("OK", 0) + 1
+    return True
 
 
 # ----------------------------- TRADING --------------------------------
@@ -215,7 +254,9 @@ async def scanner(app):
                     log.info("Solde insuffisant (%.4f SOL, il faut > %.2f) : scan en pause", bal, SOL_RESERVE + MIN_BUY_SOL)
                     S["lowlog"] = time.time()
                 continue  # on attend qu'une vente en libère
-            coins = await get_json(s, CANDIDATES_URL)
+            coins = []
+            for off in PAGES:
+                coins += await get_json(s, CANDIDATES_URL.format(off=off))
             if coins and not S["sampled"]:
                 log.info("SAMPLE COIN (brut): %s", coins[0])
                 log.info("SAMPLE COIN (parsé): %s", parse_coin(coins[0]))
@@ -244,6 +285,9 @@ async def scanner(app):
                 break
         except Exception as e:
             log.warning("scanner: %s", e)
+        if time.time() - S["stats_ts"] > 60:
+            log.info("Bilan 60s (rejets par filtre): %s", S["stats"])
+            S["stats"], S["stats_ts"] = {}, time.time()
 
 
 async def sell(app, s, mint, pct, reason, mc):
