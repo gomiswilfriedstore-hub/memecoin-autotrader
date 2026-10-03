@@ -166,13 +166,12 @@ async def sol_balance(s) -> float:
 
 
 async def available(s) -> float:
-    """Solde utilisable. En DRY_RUN : portefeuille virtuel (achats/ventes simulés)."""
-    real = await sol_balance(s)
-    if not DRY_RUN:
-        return real
-    if S["virtual"] is None:
-        S["virtual"] = real
-    return S["virtual"]
+    """Solde utilisable. En DRY_RUN : portefeuille virtuel (DRY_RUN_BALANCE, 1 SOL par défaut)."""
+    if DRY_RUN:
+        if S["virtual"] is None:
+            S["virtual"] = float(os.getenv("DRY_RUN_BALANCE", "1"))
+        return S["virtual"]
+    return await sol_balance(s)
 
 
 async def fetch_mc(s, mint):
@@ -210,8 +209,12 @@ async def scanner(app):
         if not S["on"]:
             continue
         try:
-            if await available(s) - SOL_RESERVE < MIN_BUY_SOL:
-                continue  # pas assez de SOL : on attend qu'une vente en libère
+            bal = await available(s)
+            if bal - SOL_RESERVE < MIN_BUY_SOL:
+                if time.time() - S.get("lowlog", 0) > 300:
+                    log.info("Solde insuffisant (%.4f SOL, il faut > %.2f) : scan en pause", bal, SOL_RESERVE + MIN_BUY_SOL)
+                    S["lowlog"] = time.time()
+                continue  # on attend qu'une vente en libère
             coins = await get_json(s, CANDIDATES_URL)
             if coins and not S["sampled"]:
                 log.info("SAMPLE COIN (brut): %s", coins[0])
